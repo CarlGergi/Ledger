@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - ledger-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  ledger-pg:
