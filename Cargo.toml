@@ -1,11 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/ledger-store", "crates/ledger-tools"]
+members = [
+    "crates/ledger-store",
+    "crates/ledger-testkit",
+    "crates/ledger-tools",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99"
 publish = false
 
 [workspace.dependencies]
@@ -14,6 +18,8 @@ async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+ledger-store = { path = "crates/ledger-store" }
+ledger-testkit = { path = "crates/ledger-testkit" }
 rmcp = { version = "3.8", features = [
     "client",
     "macros",

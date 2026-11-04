@@ -43,10 +43,6 @@ impl PgEventStore {
         MIGRATOR.run(&self.pool).await.map_err(sqlx::Error::from)?;
         Ok(())
     }
-
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
 }
 
 #[derive(sqlx::FromRow)]

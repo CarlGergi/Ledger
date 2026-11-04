@@ -1,6 +1,10 @@
 services:
   postgres:
     image: postgres:17
+    # A process orphaned in the container is adopted by PID 1. If that is Postgres, it
+    # takes the process for a backend, and one that exits non-zero, such as a timed-out
+    # health check's pg_isready, makes it restart every connection as if after a crash.
+    init: true
     environment:
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: ledger
@@ -13,7 +17,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
       interval: 1s
-      timeout: 3s
+      timeout: 10s
       retries: 30
 
 volumes:

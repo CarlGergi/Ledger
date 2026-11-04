@@ -1,15 +1,17 @@
 use std::collections::HashSet;
 
 use ledger_store::{EventKind, EventStore, NewEvent, Outcome, PgEventStore};
+use ledger_testkit::TestDb;
 use serde_json::json;
-use sqlx::PgPool;
 
 fn request(session: &str, tool: &str) -> NewEvent {
     NewEvent::request(session, tool, json!({"arguments": {}}))
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn sequences_start_at_one_and_have_no_gaps(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn sequences_start_at_one_and_have_no_gaps() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     for expected in 1..=5 {
         let event = store.append(request("s", "t")).await.unwrap();
@@ -25,8 +27,10 @@ async fn sequences_start_at_one_and_have_no_gaps(pool: PgPool) {
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn sessions_have_independent_sequences(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_have_independent_sequences() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     assert_eq!(store.append(request("a", "t")).await.unwrap().seq, 1);
     assert_eq!(store.append(request("a", "t")).await.unwrap().seq, 2);
@@ -35,8 +39,10 @@ async fn sessions_have_independent_sequences(pool: PgPool) {
     assert_eq!(store.session_events("b").await.unwrap().len(), 1);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn concurrent_appends_stay_gapless(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_appends_stay_gapless() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     let tasks: Vec<_> = (0..64)
         .map(|_| {
@@ -54,20 +60,24 @@ async fn concurrent_appends_stay_gapless(pool: PgPool) {
     assert_eq!(seen, (1..=64).collect::<HashSet<i64>>());
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn a_rejected_append_consumes_no_sequence_number(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_append_consumes_no_sequence_number() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     store.append(request("s", "t")).await.unwrap();
 
     // Points at a request that does not exist, so the foreign key rejects it.
     let orphan = NewEvent::response("s", 99, "t", Outcome::Ok, json!({}));
-    assert!(store.append(orphan.clone()).await.is_err());
+    assert!(store.append(orphan).await.is_err());
 
     assert_eq!(store.append(request("s", "t")).await.unwrap().seq, 2);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn duplicate_session_and_sequence_is_rejected(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_session_and_sequence_is_rejected() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool.clone());
     store.append(request("s", "t")).await.unwrap();
 
@@ -81,8 +91,10 @@ async fn duplicate_session_and_sequence_is_rejected(pool: PgPool) {
     assert!(err.as_database_error().unwrap().is_unique_violation());
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn a_call_cannot_have_two_responses(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_cannot_have_two_responses() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     let req = store.append(request("s", "t")).await.unwrap();
     let response = NewEvent::response("s", req.seq, "t", Outcome::Ok, json!({}));
@@ -91,8 +103,10 @@ async fn a_call_cannot_have_two_responses(pool: PgPool) {
     assert_eq!(store.session_events("s").await.unwrap().len(), 2);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn the_schema_refuses_malformed_events(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn the_schema_refuses_malformed_events() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool.clone());
     store.append(request("s", "t")).await.unwrap();
 
@@ -133,8 +147,10 @@ async fn the_schema_refuses_malformed_events(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn the_log_cannot_be_rewritten(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn the_log_cannot_be_rewritten() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool.clone());
     store.append(request("s", "t")).await.unwrap();
 
@@ -152,8 +168,10 @@ async fn the_log_cannot_be_rewritten(pool: PgPool) {
     assert_eq!(store.session_events("s").await.unwrap().len(), 1);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn payloads_round_trip_exactly(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn payloads_round_trip_exactly() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     // NUL is legal JSON that JSONB would refuse.
     let payload = json!({
@@ -171,8 +189,10 @@ async fn payloads_round_trip_exactly(pool: PgPool) {
     assert_eq!(read.payload, payload);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn responses_link_back_to_their_request(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_link_back_to_their_request() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     let req = store.append(request("s", "t")).await.unwrap();
     let res = store
@@ -194,8 +214,10 @@ async fn responses_link_back_to_their_request(pool: PgPool) {
     assert_eq!(events[1], res);
 }
 
-#[sqlx::test(migrator = "ledger_store::MIGRATOR")]
-async fn sessions_are_listed_with_their_event_counts(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_are_listed_with_their_event_counts() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
     let store = PgEventStore::new(pool);
     store.append(request("a", "t")).await.unwrap();
     store.append(request("a", "t")).await.unwrap();
