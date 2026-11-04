@@ -2,7 +2,7 @@
 //! every send is a countable side effect.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -38,10 +38,6 @@ impl Outbox {
             path: path.into(),
             write_lock: Mutex::new(()),
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub async fn deliver(&self, email: &SentEmail) -> io::Result<()> {

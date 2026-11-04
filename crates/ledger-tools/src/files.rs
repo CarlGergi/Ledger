@@ -29,6 +29,8 @@ pub struct ReadFileRequest {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct WriteFileResponse {
     pub path: String,
+    // The default schema says `format: uint64`, which standard validators warn about.
+    #[schemars(with = "serde_json::Number")]
     pub bytes_written: u64,
 }
 
@@ -243,6 +245,13 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
         assert!(!elsewhere.join("new.txt").exists());
+    }
+
+    #[test]
+    fn output_schemas_use_only_standard_formats() {
+        let schema = FileServer::write_file_tool_attr().output_schema.unwrap();
+        let bytes_written = &schema["properties"]["bytes_written"];
+        assert!(bytes_written.get("format").is_none(), "{bytes_written}");
     }
 
     #[test]
