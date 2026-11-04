@@ -1,0 +1,11 @@
+# Local development configuration; `make demo` starts these two tool servers.
+listen = "127.0.0.1:7100"
+call_timeout_secs = 60
+
+[[upstream]]
+name = "email"
+url = "http://127.0.0.1:7101/mcp"
+
+[[upstream]]
+name = "files"
+url = "http://127.0.0.1:7102/mcp"
