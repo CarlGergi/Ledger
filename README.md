@@ -115,7 +115,9 @@ make log SESSION=<id>
 | `make interop` | Drives the gateway with the official TypeScript MCP client, configured only with a URL |
 | `make reproduce` | Runs all of the above, plus lint |
 
-Each database test gets its own randomly named database, so test runs can overlap on one server. A killed test run can leave databases behind; `make db-reset` clears them, along with all recorded sessions.
+Each database test gets its own randomly named database, so test runs can overlap on one server, as long as each has its own `CARGO_TARGET_DIR`: even with nothing to build, `cargo test` relinks the binaries that another run's tests may be starting. A killed test run can leave databases behind; `make db-reset` clears them, along with all recorded sessions.
+
+A test that restarts a server reserves its port from below the range the kernel hands out by itself, so while the server is down, connections are refused and nothing else can be given the port.
 
 ## Layout
 

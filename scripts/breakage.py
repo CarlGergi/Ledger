@@ -9,6 +9,7 @@ behind. Usage: breakage.py [--list] [name-filter]
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 GATEWAY = "crates/ledger-gateway/src/gateway.rs"
 MIGRATION = "crates/ledger-store/migrations/0001_event_log.sql"
 STORE = "crates/ledger-store/src/postgres.rs"
+PORT = "crates/ledger-testkit/src/port.rs"
 TEST_TIMEOUT_SECS = 300
 
 
@@ -209,24 +211,47 @@ FAULTS = [
             )
         ],
     ),
+    Fault(
+        "reserved test ports overlap the ones the kernel hands out",
+        "the_kernel_never_hands_out_a_reserved_port",
+        PORT,
+        [("const PORTS: Range<u16> = 21000..25000;", "const PORTS: Range<u16> = 50000..54000;")],
+    ),
+    Fault(
+        "a reserved test port ignores something already on it",
+        "a_port_with_something_else_on_it_is_not_claimed",
+        PORT,
+        [("            _ => None,\n", "            _ => Some(reserved),\n")],
+    ),
+    Fault(
+        "a reserved test port does not stay claimed",
+        "a_port_has_one_owner",
+        PORT,
+        [("            _claim: claim,", "            _claim: TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?,")],
+    ),
 ]
 
 
 def run_tests(copy: Path) -> tuple[bool, dict[str, str], str]:
     """Returns whether the suite finished, each failed test's panic, and any compile error."""
     env = dict(os.environ, CARGO_TARGET_DIR=str(ROOT / "target" / "breakage"))
+    # In a process group of its own, so that a timeout also ends the test binaries, which
+    # would otherwise carry on by themselves, holding their databases.
+    tests = subprocess.Popen(
+        ["cargo", "test", "--workspace", "--tests", "--no-fail-fast"],
+        cwd=copy,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        result = subprocess.run(
-            ["cargo", "test", "--workspace", "--tests", "--no-fail-fast"],
-            cwd=copy,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=TEST_TIMEOUT_SECS,
-        )
+        output, _ = tests.communicate(timeout=TEST_TIMEOUT_SECS)
     except subprocess.TimeoutExpired:
+        os.killpg(tests.pid, signal.SIGKILL)
+        tests.wait()
         return False, {}, ""
-    output = result.stdout + result.stderr
     failed = dict.fromkeys(re.findall(r"^test (\S+) \.\.\. FAILED", output, re.M), "")
     for name, panic in re.findall(r"^thread '([^']+)'[^\n]* panicked at [^\n]*\n([^\n]*)", output, re.M):
         if name in failed:
@@ -255,6 +280,8 @@ def check(fault: Fault, copy: Path) -> tuple[bool, str]:
         return False, f"the fault does not compile: {compile_error}"
     if not finished:
         return False, f"the tests hung for {TEST_TIMEOUT_SECS}s instead of failing"
+    # Unit tests report as `module::tests::name`.
+    failed = {name.split("::")[-1]: panic for name, panic in failed.items()}
     if fault.caught_by not in failed:
         others = f" (these did: {failed})" if failed else ""
         return False, f"{fault.caught_by} still passes{others}"

@@ -2,12 +2,13 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use common::{Probe, eventually, spawn_tool_server};
 use ledger_store::{EventKind, EventStore, Outcome, PgEventStore};
-use ledger_testkit::TestDb;
+use ledger_testkit::{ReservedPort, TestDb};
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
 use sample_agent::{call_params, connect, run_script};
@@ -22,14 +23,6 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn start_ledger(config: &std::path::Path, database_url: &str) -> KillOnDrop {
@@ -57,13 +50,8 @@ fn ledger_output(args: &[&str], database_url: &str) -> (bool, String) {
     )
 }
 
-async fn wait_for_port(port: u16) {
-    eventually(|| async move {
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-    })
-    .await;
+async fn wait_for_listener(addr: SocketAddr) {
+    eventually(|| async move { tokio::net::TcpStream::connect(addr).await.is_ok() }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -75,13 +63,14 @@ async fn the_binary_serves_records_and_survives_being_killed() {
     let email_url = spawn_tool_server(EmailServer::new(outbox.clone())).await;
     let files_url = spawn_tool_server(FileServer::new(dir.path()).unwrap()).await;
 
-    let port = free_port();
+    let port = ReservedPort::claim();
+    let addr = port.addr();
     let config = dir.path().join("ledger.toml");
     std::fs::write(
         &config,
         format!(
             r#"
-            listen = "127.0.0.1:{port}"
+            listen = "{addr}"
             [[upstream]]
             name = "email"
             url = "{email_url}"
@@ -94,10 +83,10 @@ async fn the_binary_serves_records_and_survives_being_killed() {
     .unwrap();
 
     let db_url = db.url();
-    let url = format!("http://127.0.0.1:{port}/mcp");
+    let url = format!("http://{addr}/mcp");
 
     let mut ledger = start_ledger(&config, db_url);
-    wait_for_port(port).await;
+    wait_for_listener(addr).await;
     let agent = connect(&url, Some("run-1")).await.unwrap();
     let steps = run_script(&agent, "first").await.unwrap();
 
@@ -111,7 +100,7 @@ async fn the_binary_serves_records_and_survives_being_killed() {
     assert_eq!(before.len(), steps.len() * 2);
 
     let _ledger = start_ledger(&config, db_url);
-    wait_for_port(port).await;
+    wait_for_listener(addr).await;
     let agent = connect(&url, Some("run-1")).await.unwrap();
     run_script(&agent, "second").await.unwrap();
 
@@ -162,13 +151,14 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
     let probe = Probe::new(store.clone(), "s");
     let probe_url = spawn_tool_server(probe.clone()).await;
 
-    let port = free_port();
+    let port = ReservedPort::claim();
+    let addr = port.addr();
     let config = dir.path().join("ledger.toml");
     std::fs::write(
         &config,
         format!(
             r#"
-            listen = "127.0.0.1:{port}"
+            listen = "{addr}"
             [[upstream]]
             name = "probe"
             url = "{probe_url}"
@@ -178,9 +168,9 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
     .unwrap();
 
     let db_url = db.url();
-    let url = format!("http://127.0.0.1:{port}/mcp");
+    let url = format!("http://{addr}/mcp");
     let mut ledger = start_ledger(&config, db_url);
-    wait_for_port(port).await;
+    wait_for_listener(addr).await;
 
     let agent = connect(&url, Some("s")).await.unwrap();
     let in_flight =
@@ -200,7 +190,7 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
 
     // The next copy carries on from there without a gap.
     let _ledger = start_ledger(&config, db_url);
-    wait_for_port(port).await;
+    wait_for_listener(addr).await;
     let agent = connect(&url, Some("s")).await.unwrap();
     agent
         .call_tool(call_params("probe__observe", json!({})))

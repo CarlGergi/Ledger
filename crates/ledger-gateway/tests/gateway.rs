@@ -2,7 +2,6 @@ mod common;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use common::{
 };
 use ledger_gateway::{Gateway, error_codes};
 use ledger_store::{Event, EventKind, EventStore, Outcome, PgEventStore};
-use ledger_testkit::TestDb;
+use ledger_testkit::{ReservedPort, TestDb};
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::http::serve_mcp;
 use rmcp::model::{
@@ -55,7 +54,7 @@ fn send_email() -> CallToolRequestParams {
 
 /// An email server a test can stop and bring back on the same port.
 struct RestartableEmailServer {
-    addr: SocketAddr,
+    port: ReservedPort,
     outbox: Arc<Outbox>,
     shutdown: CancellationToken,
     task: JoinHandle<io::Result<()>>,
@@ -66,8 +65,8 @@ impl RestartableEmailServer {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let outbox = Arc::new(Outbox::new(dir.path().join("outbox.jsonl")));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let port = ReservedPort::claim();
+        let listener = TcpListener::bind(port.addr()).await.unwrap();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_mcp(
             EmailServer::new(outbox.clone()),
@@ -75,7 +74,7 @@ impl RestartableEmailServer {
             shutdown.clone(),
         ));
         Self {
-            addr,
+            port,
             outbox,
             shutdown,
             task,
@@ -84,7 +83,7 @@ impl RestartableEmailServer {
     }
 
     fn url(&self) -> String {
-        format!("http://{}/mcp", self.addr)
+        format!("http://{}/mcp", self.port.addr())
     }
 
     async fn stop(&mut self) {
@@ -93,7 +92,7 @@ impl RestartableEmailServer {
     }
 
     async fn start_again(&mut self) {
-        let listener = TcpListener::bind(self.addr).await.unwrap();
+        let listener = TcpListener::bind(self.port.addr()).await.unwrap();
         self.shutdown = CancellationToken::new();
         self.task = tokio::spawn(serve_mcp(
             EmailServer::new(self.outbox.clone()),
@@ -656,12 +655,9 @@ async fn a_dead_upstream_only_hides_its_own_tools() {
     let dir = tempfile::tempdir().unwrap();
     let server = ledger_tools::files::FileServer::new(dir.path()).unwrap();
     let files_url = spawn_tool_server(server).await;
-    let unused_port = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    let unused = ReservedPort::claim();
     let upstreams = vec![
-        upstream("down", &format!("http://127.0.0.1:{unused_port}/mcp")),
+        upstream("down", &format!("http://{}/mcp", unused.addr())),
         upstream("files", &files_url),
     ];
     let url = spawn_gateway(Gateway::new(store, upstreams, CALL_TIMEOUT)).await;
