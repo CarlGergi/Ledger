@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -7,18 +8,19 @@ use ledger_store::{EventStore, NewEvent, Outcome};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, DiscoverRequestMethod, DiscoverResult, ErrorCode,
     Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
-    ServerResult,
+    ServerResult, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler};
 use serde_json::{Value, json};
 
+use crate::policy::{Effect, EffectPolicy};
 use crate::session::resolve_session;
 use crate::upstream::{Upstream, UpstreamError};
 
 /// Agents see each tool as `<upstream>__<tool>`, which keeps names from different
 /// servers apart and makes routing a matter of reading the name.
-const TOOL_SEPARATOR: &str = "__";
+pub(crate) const TOOL_SEPARATOR: &str = "__";
 
 /// JSON-RPC errors the gateway itself raises, in the server-defined range.
 pub mod error_codes {
@@ -41,6 +43,9 @@ struct Inner {
     store: Arc<dyn EventStore>,
     upstreams: Vec<Arc<dyn Upstream>>,
     call_timeout: Duration,
+    policy: EffectPolicy,
+    /// The latest listing of each tool, by the name agents know it by.
+    catalog: Mutex<HashMap<String, Tool>>,
 }
 
 enum Forwarded {
@@ -50,16 +55,28 @@ enum Forwarded {
 }
 
 impl Gateway {
+    /// A gateway that takes every tool's annotations at their word.
     pub fn new(
         store: Arc<dyn EventStore>,
         upstreams: Vec<Arc<dyn Upstream>>,
         call_timeout: Duration,
+    ) -> Self {
+        Self::with_policy(store, upstreams, call_timeout, EffectPolicy::default())
+    }
+
+    pub fn with_policy(
+        store: Arc<dyn EventStore>,
+        upstreams: Vec<Arc<dyn Upstream>>,
+        call_timeout: Duration,
+        policy: EffectPolicy,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 upstreams,
                 call_timeout,
+                policy,
+                catalog: Mutex::default(),
             }),
         }
     }
@@ -77,7 +94,9 @@ impl Gateway {
         let tool = params.name.to_string();
         let store = &self.inner.store;
 
-        let request_payload = json!({ "rpc_id": rpc_id, "meta": meta, "params": params });
+        let effect = self.effect_of(&tool).await;
+        let request_payload =
+            json!({ "rpc_id": rpc_id, "meta": meta, "effect": effect, "params": params });
         let request = store
             .append(NewEvent::request(session, &tool, request_payload))
             .await
@@ -113,6 +132,54 @@ impl Gateway {
             })?;
 
         self.agent_view(forwarded, &tool)
+    }
+
+    /// What is known about a tool's effects, asking its server if this copy has not seen it.
+    async fn effect_of(&self, name: &str) -> Effect {
+        let policy = &self.inner.policy;
+        if !policy.has_override(name)
+            && self.listed(name).is_none()
+            && let Some((upstream, _)) = self.route(name)
+        {
+            self.list_upstream(upstream).await;
+        }
+        policy.effect_of(name, self.listed(name).as_ref())
+    }
+
+    fn listed(&self, name: &str) -> Option<Tool> {
+        let catalog = self.inner.catalog.lock().expect("catalog lock poisoned");
+        catalog.get(name).cloned()
+    }
+
+    /// One server's tools under the names agents know them by, or nothing if it cannot
+    /// say. A failed listing leaves what was last learned about its tools in place.
+    async fn list_upstream(&self, upstream: &Arc<dyn Upstream>) -> Vec<Tool> {
+        let name = upstream.name();
+        let listing = tokio::time::timeout(self.inner.call_timeout, upstream.list_tools()).await;
+        let listed = match listing {
+            Ok(Ok(listed)) => listed,
+            Ok(Err(e)) => {
+                tracing::warn!(upstream = name, error = %e, "leaving out unavailable tools");
+                return Vec::new();
+            }
+            Err(_) => {
+                tracing::warn!(upstream = name, "leaving out tools: no answer in time");
+                return Vec::new();
+            }
+        };
+        let tools: Vec<Tool> = listed
+            .into_iter()
+            .map(|mut tool| {
+                tool.name = Cow::Owned(prefixed(name, &tool.name));
+                tool
+            })
+            .collect();
+
+        let own_prefix = prefixed(name, "");
+        let mut catalog = self.inner.catalog.lock().expect("catalog lock poisoned");
+        catalog.retain(|known, _| !known.starts_with(&own_prefix));
+        catalog.extend(tools.iter().map(|t| (t.name.to_string(), t.clone())));
+        tools
     }
 
     async fn forward(&self, mut params: CallToolRequestParams) -> Forwarded {
@@ -208,24 +275,8 @@ impl ServerHandler for Gateway {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let timeout = self.inner.call_timeout;
-        let listings = join_all(self.inner.upstreams.iter().map(|upstream| async move {
-            let listing = tokio::time::timeout(timeout, upstream.list_tools()).await;
-            (upstream.name(), listing)
-        }))
-        .await;
-
-        let mut tools = Vec::new();
-        for (upstream, listing) in listings {
-            match listing {
-                Ok(Ok(listed)) => tools.extend(listed.into_iter().map(|mut tool| {
-                    tool.name = Cow::Owned(prefixed(upstream, &tool.name));
-                    tool
-                })),
-                Ok(Err(e)) => tracing::warn!(upstream, error = %e, "leaving out unavailable tools"),
-                Err(_) => tracing::warn!(upstream, "leaving out tools: no answer in time"),
-            }
-        }
+        let listings = join_all(self.inner.upstreams.iter().map(|u| self.list_upstream(u))).await;
+        let tools = listings.into_iter().flatten().collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
 

@@ -1,9 +1,11 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
+
+use crate::policy::EffectPolicy;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +24,9 @@ pub struct Config {
     /// Extra `Host` values to accept. Empty means loopback only.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// A file correcting what tools claim about themselves. A relative path is taken
+    /// from the directory of this config file.
+    pub effect_overrides: Option<PathBuf>,
     #[serde(rename = "upstream", default)]
     pub upstreams: Vec<UpstreamConfig>,
 }
@@ -49,7 +54,24 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("in {}", path.display()))
+        let mut config = Self::parse(&text).with_context(|| format!("in {}", path.display()))?;
+        if let (Some(overrides), Some(directory)) = (&config.effect_overrides, path.parent()) {
+            config.effect_overrides = Some(directory.join(overrides));
+        }
+        Ok(config)
+    }
+
+    /// The effect policy this config asks for, with its upstream names checked.
+    pub fn effect_policy(&self) -> anyhow::Result<EffectPolicy> {
+        let Some(path) = &self.effect_overrides else {
+            return Ok(EffectPolicy::default());
+        };
+        let policy = EffectPolicy::load(path)?;
+        let upstreams: Vec<&str> = self.upstreams.iter().map(|u| u.name.as_str()).collect();
+        policy
+            .check_upstreams(&upstreams)
+            .with_context(|| format!("in {}", path.display()))?;
+        Ok(policy)
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
@@ -116,6 +138,7 @@ mod tests {
         assert_eq!(config.connect_timeout(), Duration::from_secs(5));
         assert_eq!(config.database_url, None);
         assert!(config.allowed_hosts.is_empty());
+        assert_eq!(config.effect_overrides, None);
         assert_eq!(config.upstreams[0].name, "email");
     }
 
@@ -165,5 +188,60 @@ mod tests {
     fn a_missing_file_names_the_path() {
         let err = Config::load(Path::new("/nonexistent/ledger.toml")).unwrap_err();
         assert!(format!("{err:#}").contains("/nonexistent/ledger.toml"));
+    }
+
+    fn config_with_overrides(overrides: &str, entry: &str) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("effects.toml"), entry).unwrap();
+        let path = dir.path().join("ledger.toml");
+        let text = format!("effect_overrides = {overrides:?}\n{UPSTREAMS}");
+        std::fs::write(&path, text).unwrap();
+        let config = Config::load(&path).unwrap();
+        (dir, config)
+    }
+
+    #[test]
+    fn an_override_file_is_found_next_to_the_config() {
+        let (_dir, config) =
+            config_with_overrides("effects.toml", "[tool.email__send]\nclass = \"keyed\"");
+        assert!(config.effect_policy().unwrap().has_override("email__send"));
+    }
+
+    #[test]
+    fn an_override_file_can_be_an_absolute_path() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = elsewhere.path().join("mine.toml");
+        std::fs::write(&path, "[tool.email__send]\nclass = \"keyed\"").unwrap();
+        let (_dir, config) = config_with_overrides(path.to_str().unwrap(), "");
+        assert!(config.effect_policy().unwrap().has_override("email__send"));
+    }
+
+    #[test]
+    fn an_override_for_an_unconfigured_upstream_stops_startup() {
+        let (_dir, config) =
+            config_with_overrides("effects.toml", "[tool.pay__charge]\nclass = \"keyed\"");
+        let error = format!("{:#}", config.effect_policy().unwrap_err());
+        assert!(error.contains("pay__charge"), "{error}");
+        assert!(error.contains("effects.toml"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_override_file_stops_startup() {
+        let (_dir, config) = config_with_overrides("missing.toml", "");
+        let error = format!("{:#}", config.effect_policy().unwrap_err());
+        assert!(error.contains("missing.toml"), "{error}");
+    }
+
+    #[test]
+    fn the_shipped_config_is_valid() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/ledger.toml");
+        let config = Config::load(&path).unwrap();
+        config.effect_policy().unwrap();
+    }
+
+    #[test]
+    fn no_override_file_means_no_overrides() {
+        let config = Config::parse(UPSTREAMS).unwrap();
+        assert!(!config.effect_policy().unwrap().has_override("email__send"));
     }
 }

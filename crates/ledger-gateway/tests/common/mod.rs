@@ -14,6 +14,7 @@ use ledger_tools::http::serve_mcp;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
     PaginatedRequestParams, RequestMetaObject, ServerCapabilities, ServerConfig, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler};
@@ -125,6 +126,7 @@ impl EventStore for FaultyStore {
 /// - `observe` records what the log held at the moment the tool ran.
 /// - `wait` runs only once the test calls `release`.
 /// - `reject` answers with a JSON-RPC error.
+/// - Every tool is listed with `annotations`, and `listings` counts the listings.
 #[derive(Clone)]
 pub struct Probe {
     pub store: Arc<dyn EventStore>,
@@ -132,6 +134,8 @@ pub struct Probe {
     pub observed: Arc<Mutex<Option<Vec<Event>>>>,
     pub received_meta: Arc<Mutex<Option<RequestMetaObject>>>,
     pub stall_listing: bool,
+    pub annotations: Option<ToolAnnotations>,
+    pub listings: Arc<AtomicUsize>,
     pub gate: Arc<Semaphore>,
     pub started: Arc<AtomicUsize>,
     pub finished: Arc<AtomicUsize>,
@@ -145,6 +149,8 @@ impl Probe {
             observed: Arc::default(),
             received_meta: Arc::default(),
             stall_listing: false,
+            annotations: None,
+            listings: Arc::default(),
             gate: Arc::new(Semaphore::new(0)),
             started: Arc::default(),
             finished: Arc::default(),
@@ -170,6 +176,7 @@ impl ServerHandler for Probe {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
         if self.stall_listing {
             std::future::pending::<()>().await;
         }
@@ -181,7 +188,11 @@ impl ServerHandler for Probe {
         );
         let tools = ["observe", "wait", "reject"]
             .into_iter()
-            .map(|name| Tool::new(name, "probe", schema.clone()))
+            .map(|name| {
+                let mut tool = Tool::new(name, "probe", schema.clone());
+                tool.annotations = self.annotations.clone();
+                tool
+            })
             .collect();
         Ok(ListToolsResult::with_all_items(tools))
     }

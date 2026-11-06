@@ -92,6 +92,7 @@ The gateway reads a TOML file; see [`config/ledger.toml`](config/ledger.toml).
 | `database_url` | none | Used when `DATABASE_URL` is not set |
 | `call_timeout_secs` | `60` | How long a call waits for its tool, or for a database connection |
 | `connect_timeout_secs` | `5` | How long a tool server has to accept a new connection |
+| `effect_overrides` | none | File correcting what tools claim about their effects, relative to this one |
 | `allowed_hosts` | loopback only | `Host` values to accept |
 | `[[upstream]]` | none | A tool server: `name` and `url` |
 
@@ -106,6 +107,23 @@ make log SESSION=<id>
 ```
 
 `ledger log <id> --json` prints full events, including arguments and results, one per line.
+
+## Effect classes
+
+Each tool gets a class that says how safely its calls can be repeated, and each request in the log records the class it was given and why.
+
+| Class | Meaning | A tool gets it by |
+| --- | --- | --- |
+| `read_only` | Changes nothing | `readOnlyHint: true`, unless it also says `destructiveHint: true` |
+| `idempotent` | Repeating it with the same arguments has no further effect | `idempotentHint: true` |
+| `keyed` | Repeats with the same key take effect once | Declaring an `idempotency_key` input |
+| `at_most_once` | Nothing makes a second run safe | Anything else, including having no annotations or not being listed |
+
+Annotations are only claims made by the tool server, so a file named by `effect_overrides` in the config can correct them, and it always wins. `config/effects.toml` shows the format. A tool named after a server that is not configured stops the gateway at startup, because a typo there would silently leave a tool uncorrected. A misspelled tool name on a real server cannot be caught that way.
+
+The gateway learns annotations from listings, whether an agent asked for them or the gateway needed them for a call. A server that is unreachable or stalled when asked costs the call up to `call_timeout_secs` of extra waiting.
+
+So far the class is only recorded; nothing acts on it yet.
 
 ## Testing
 

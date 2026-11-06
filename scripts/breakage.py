@@ -18,6 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GATEWAY = "crates/ledger-gateway/src/gateway.rs"
+GATEWAY_MAIN = "crates/ledger-gateway/src/main.rs"
+POLICY = "crates/ledger-gateway/src/policy.rs"
 MIGRATION = "crates/ledger-store/migrations/0001_event_log.sql"
 STORE = "crates/ledger-store/src/postgres.rs"
 PORT = "crates/ledger-testkit/src/port.rs"
@@ -117,9 +119,9 @@ FAULTS = [
         GATEWAY,
         [
             (
-                "                    tool.name = Cow::Owned(prefixed(upstream, &tool.name));\n",
-                "                    tool.name = Cow::Owned(prefixed(upstream, &tool.name));\n"
-                "                    tool.annotations = None;\n",
+                "                tool.name = Cow::Owned(prefixed(name, &tool.name));\n",
+                "                tool.name = Cow::Owned(prefixed(name, &tool.name));\n"
+                "                tool.annotations = None;\n",
             )
         ],
     ),
@@ -144,8 +146,8 @@ FAULTS = [
         GATEWAY,
         [
             (
-                "tokio::time::timeout(timeout, upstream.list_tools())",
-                "tokio::time::timeout(timeout * 1000, upstream.list_tools())",
+                "tokio::time::timeout(self.inner.call_timeout, upstream.list_tools())",
+                "tokio::time::timeout(self.inner.call_timeout * 1000, upstream.list_tools())",
             )
         ],
     ),
@@ -167,8 +169,8 @@ FAULTS = [
         GATEWAY,
         [
             (
-                'json!({ "rpc_id": rpc_id, "meta": meta, "params": params })',
-                'json!({ "rpc_id": rpc_id, "params": params })',
+                '"meta": meta, "effect": effect, ',
+                '"effect": effect, ',
             )
         ],
     ),
@@ -240,6 +242,83 @@ FAULTS = [
         "a_port_has_one_owner",
         PORT,
         [("            _claim: claim,", "            _claim: TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?,")],
+    ),
+    Fault(
+        "effect policy ignores the override file",
+        "a_wrong_annotation_is_believed_until_the_override_file_corrects_it",
+        POLICY,
+        [
+            (
+                "if let Some(entry) = self.overrides.get(name) {",
+                'if let Some(entry) = self.overrides.get(name).filter(|_| name.is_empty()) {',
+            )
+        ],
+    ),
+    Fault(
+        "effect policy treats an unannotated tool as idempotent",
+        "an_unannotated_tool_gets_the_safest_class",
+        POLICY,
+        [
+            (
+                "let idempotent = annotations.is_some_and(|a| a.idempotent_hint == Some(true));",
+                "let idempotent = annotations.is_none_or(|a| a.idempotent_hint != Some(false));",
+            )
+        ],
+    ),
+    Fault(
+        "effect policy treats an unknown tool as read-only",
+        "a_tool_its_server_does_not_list_gets_the_safest_class",
+        POLICY,
+        [
+            (
+                """                class: EffectClass::AtMostOnce,
+                source: EffectSource::Unlisted,""",
+                """                class: EffectClass::ReadOnly,
+                source: EffectSource::Unlisted,""",
+            )
+        ],
+    ),
+    Fault(
+        "effect policy lets read-only outrank destructive",
+        "a_read_only_tool_that_is_also_destructive_is_not_read_only",
+        POLICY,
+        [(" && a.destructive_hint != Some(true)", "")],
+    ),
+    Fault(
+        "effect policy accepts an override for an unknown upstream",
+        "an_override_for_an_unknown_upstream_is_refused",
+        POLICY,
+        [("upstreams.contains(&upstream),", "upstreams.contains(&upstream) || !upstream.is_empty(),")],
+    ),
+    Fault(
+        "effect policy keeps tools a server stopped listing",
+        "the_latest_listing_decides_and_a_failed_one_changes_nothing",
+        GATEWAY,
+        [("        catalog.retain(|known, _| !known.starts_with(&own_prefix));\n", "        let _ = own_prefix;\n")],
+    ),
+    Fault(
+        "effect policy never asks a server about a tool it has not seen",
+        "a_tool_server_is_asked_once_rather_than_on_every_call",
+        GATEWAY,
+        [("            self.list_upstream(upstream).await;\n        }\n        policy", "            let _ = upstream;\n        }\n        policy")],
+    ),
+    Fault(
+        "effect policy lists tools again on every call",
+        "a_tool_server_is_asked_once_rather_than_on_every_call",
+        GATEWAY,
+        [("            && self.listed(name).is_none()\n", "")],
+    ),
+    Fault(
+        "effect policy decisions are left out of the log",
+        "the_real_tools_are_logged_with_the_class_their_annotations_give",
+        GATEWAY,
+        [('"effect": effect, ', "")],
+    ),
+    Fault(
+        "effect policy file errors do not stop startup",
+        "a_bad_override_file_stops_the_binary_with_a_useful_message",
+        GATEWAY_MAIN,
+        [("let policy = config.effect_policy()?;", "let policy = config.effect_policy().unwrap_or_default();")],
     ),
 ]
 

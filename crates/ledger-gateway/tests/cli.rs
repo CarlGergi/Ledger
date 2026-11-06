@@ -5,6 +5,7 @@ mod common;
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use common::{Probe, eventually, spawn_tool_server};
 use ledger_store::{EventKind, EventStore, Outcome, PgEventStore};
@@ -132,7 +133,8 @@ async fn the_binary_serves_records_and_survives_being_killed() {
     assert!(ok);
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(lines.len(), after.len());
-    assert!(lines[0].contains("files__write_file") && lines[0].contains("request"));
+    assert!(lines[0].contains("files__write_file"), "{}", lines[0]);
+    assert!(lines[0].contains("request (idempotent)"), "{}", lines[0]);
     assert!(lines[1].contains("response to #1 (ok)"), "{}", lines[1]);
 
     let (ok, json_log) = ledger_output(&["log", "run-1", "--json"], db_url);
@@ -207,6 +209,53 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
     let seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, [1, 2, 3]);
     assert_eq!(events[2].request_seq, Some(2));
+}
+
+#[test]
+fn a_bad_override_file_stops_the_binary_with_a_useful_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("ledger.toml");
+    std::fs::write(
+        &config,
+        r#"
+        listen = "127.0.0.1:0"
+        effect_overrides = "effects.toml"
+        [[upstream]]
+        name = "email"
+        url = "http://127.0.0.1:1/mcp"
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("effects.toml"),
+        "[tool.emial__send]\nclass = \"keyed\"",
+    )
+    .unwrap();
+
+    let mut ledger = KillOnDrop(
+        Command::new(LEDGER)
+            .args(["serve", "--config"])
+            .arg(&config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Started the wrong way, it would serve forever rather than fail this test.
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = ledger.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the binary is still running");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    let mut stderr = String::new();
+    let mut pipe = ledger.0.stderr.take().unwrap();
+    std::io::Read::read_to_string(&mut pipe, &mut stderr).unwrap();
+    assert!(stderr.contains("emial__send"), "{stderr}");
 }
 
 #[test]

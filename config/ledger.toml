@@ -1,6 +1,7 @@
 # Local development configuration; `make demo` starts these two tool servers.
 listen = "127.0.0.1:7100"
 call_timeout_secs = 60
+effect_overrides = "effects.toml"
 
 [[upstream]]
 name = "email"

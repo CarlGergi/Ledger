@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    let policy = config.effect_policy()?;
     let database_url = std::env::var("DATABASE_URL")
         .ok()
         .or_else(|| config.database_url.clone())
@@ -103,7 +104,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 as Arc<dyn Upstream>
         })
         .collect();
-    let gateway = Gateway::new(Arc::new(store), upstreams, config.call_timeout());
+    let gateway = Gateway::with_policy(Arc::new(store), upstreams, config.call_timeout(), policy);
 
     let shutdown = CancellationToken::new();
     tokio::spawn({
@@ -127,7 +128,10 @@ fn summary(event: &Event) -> String {
         (Some(request), Some(outcome)) => {
             format!("response to #{request} ({})", outcome.as_str())
         }
-        _ => "request".to_owned(),
+        _ => match event.payload["effect"]["class"].as_str() {
+            Some(class) => format!("request ({class})"),
+            None => "request".to_owned(),
+        },
     };
     format!(
         "{:>5}  {}  {}  {what}",

@@ -1,0 +1,9 @@
+# Corrects what tool servers claim about their tools. An entry here always wins over a
+# tool's annotations. Nothing needs correcting for the demo's tool servers. For example:
+#
+# [tool.billing__status]
+# class = "at_most_once"    # read_only, idempotent, keyed, or at_most_once
+#
+# [tool.billing__charge]
+# class = "keyed"
+# key_param = "request_id"  # the input that carries the key; idempotency_key by default
