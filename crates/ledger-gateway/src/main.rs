@@ -104,7 +104,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 as Arc<dyn Upstream>
         })
         .collect();
-    let gateway = Gateway::with_policy(Arc::new(store), upstreams, config.call_timeout(), policy);
+    let gateway = Gateway::with_policy(Arc::new(store), upstreams, config.call_timeout(), policy)
+        .with_lease_ttl(config.lease_ttl());
 
     let shutdown = CancellationToken::new();
     tokio::spawn({

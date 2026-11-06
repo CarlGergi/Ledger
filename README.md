@@ -92,6 +92,7 @@ The gateway reads a TOML file; see [`config/ledger.toml`](config/ledger.toml).
 | `database_url` | none | Used when `DATABASE_URL` is not set |
 | `call_timeout_secs` | `60` | How long a call waits for its tool, or for a database connection |
 | `connect_timeout_secs` | `5` | How long a tool server has to accept a new connection |
+| `lease_secs` | `30` | How long a session stays with this copy after its last append; see below |
 | `effect_overrides` | none | File correcting what tools claim about their effects, relative to this one |
 | `allowed_hosts` | loopback only | `Host` values to accept |
 | `[[upstream]]` | none | A tool server: `name` and `url` |
@@ -125,7 +126,16 @@ The gateway learns annotations from listings, whether an agent asked for them or
 
 So far the class is only recorded; nothing acts on it yet.
 
-## Testing
+## Several gateway copies
+
+Copies of the gateway can share one database. Each session belongs to one copy at a time, through a lease in the database: a copy takes a session on its first call, and every append extends the lease by `lease_secs`. Another copy can take the session over only once the lease has expired, and taking it over gives it a higher fencing token.
+
+Every append carries its copy's token, and the statement that writes the event also checks it. So a copy that was paused, perhaps for longer than its lease, cannot append once another copy has taken over, however sure it is that it still owns the session. Its calls fail with `-32050` before they reach a tool. Lease expiry uses the database's clock, the one clock every copy shares.
+
+Each request is also logged with a SHA-256 of its arguments, in a canonical form with object keys sorted, ready for recognising retries.
+
+Fencing protects the log, not the outside world. A copy that logged a request and then paused can still forward it when it wakes. What keeps that safe is the effect class, once retries act on it.
+
 
 | Command | What it does |
 | --- | --- |
@@ -178,6 +188,8 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 ## Current limits
 
 - **No retries or deduplication yet.** A call an agent retries runs again.
+- **A call can outlast its lease.** Nothing renews a lease during a tool call, so a call longer than `lease_secs` lets another copy take the session, and the call's outcome then cannot be logged (`-32051`).
+- **A crashed copy's sessions wait for its leases.** A restarted copy cannot record in them for up to `lease_secs`, because it cannot tell itself apart from a paused original.
 - **No authentication.** Keep the gateway on loopback or behind something that authenticates.
 - **Tools only.** Resources and prompts are not passed through, and neither are progress notifications.
 - **The agent's `_meta` is logged but not forwarded,** because it describes the agent's exchange with the gateway.

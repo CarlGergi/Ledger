@@ -21,6 +21,10 @@ pub struct Config {
     /// tools waits for every server, so one dead server should not cost a whole call's limit.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// How long a session stays with this copy after its last append, before another copy
+    /// may take it over. Zero lets any copy take any session at once.
+    #[serde(default = "default_lease_secs")]
+    pub lease_secs: u64,
     /// Extra `Host` values to accept. Empty means loopback only.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
@@ -48,6 +52,10 @@ fn default_call_timeout_secs() -> u64 {
 
 fn default_connect_timeout_secs() -> u64 {
     5
+}
+
+fn default_lease_secs() -> u64 {
+    crate::gateway::DEFAULT_LEASE_TTL.as_secs()
 }
 
 impl Config {
@@ -86,6 +94,10 @@ impl Config {
 
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_secs(self.connect_timeout_secs)
+    }
+
+    pub fn lease_ttl(&self) -> Duration {
+        Duration::from_secs(self.lease_secs)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -136,6 +148,7 @@ mod tests {
         assert_eq!(config.listen, "127.0.0.1:7100");
         assert_eq!(config.call_timeout(), Duration::from_secs(60));
         assert_eq!(config.connect_timeout(), Duration::from_secs(5));
+        assert_eq!(config.lease_ttl(), Duration::from_secs(30));
         assert_eq!(config.database_url, None);
         assert!(config.allowed_hosts.is_empty());
         assert_eq!(config.effect_overrides, None);
@@ -150,6 +163,7 @@ mod tests {
             database_url = "postgres://db/ledger"
             call_timeout_secs = 5
             connect_timeout_secs = 7
+            lease_secs = 0
             allowed_hosts = ["ledger.example.com"]
             {UPSTREAMS}
             "#
@@ -159,6 +173,7 @@ mod tests {
         assert_eq!(config.database_url.as_deref(), Some("postgres://db/ledger"));
         assert_eq!(config.call_timeout(), Duration::from_secs(5));
         assert_eq!(config.connect_timeout(), Duration::from_secs(7));
+        assert_eq!(config.lease_ttl(), Duration::ZERO);
         assert_eq!(config.allowed_hosts, ["ledger.example.com"]);
     }
 

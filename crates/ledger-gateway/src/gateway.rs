@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::join_all;
-use ledger_store::{EventStore, NewEvent, Outcome};
+use ledger_store::{Event, EventStore, Lease, NewEvent, Outcome, StoreError};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, DiscoverRequestMethod, DiscoverResult, ErrorCode,
     Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
@@ -13,6 +13,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::policy::{Effect, EffectPolicy};
 use crate::session::resolve_session;
@@ -46,7 +47,15 @@ struct Inner {
     policy: EffectPolicy,
     /// The latest listing of each tool, by the name agents know it by.
     catalog: Mutex<HashMap<String, Tool>>,
+    /// Names this copy of the gateway in the leases it holds.
+    owner: String,
+    lease_ttl: Duration,
+    /// The sessions this copy believes it owns. The store has the final say.
+    leases: tokio::sync::Mutex<HashMap<String, Lease>>,
 }
+
+/// How long a session stays with a copy that has stopped appending to it.
+pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 
 enum Forwarded {
     Answered(Result<CallToolResponse, UpstreamError>),
@@ -77,8 +86,50 @@ impl Gateway {
                 call_timeout,
                 policy,
                 catalog: Mutex::default(),
+                owner: Uuid::new_v4().to_string(),
+                lease_ttl: DEFAULT_LEASE_TTL,
+                leases: tokio::sync::Mutex::default(),
             }),
         }
+    }
+
+    /// Sets how long a session stays with this copy after its last append. Another copy
+    /// can take the session over only once that has passed. Call it before serving.
+    pub fn with_lease_ttl(self, ttl: Duration) -> Self {
+        let mut inner = Arc::into_inner(self.inner).expect("configure the gateway before use");
+        inner.lease_ttl = ttl;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Appends under this copy's lease on the session, taking the lease first if it has
+    /// none. A copy that has been taken over gets `Fenced`, and does not take the session
+    /// back here: whether it may is a question for the session's next call.
+    async fn append(&self, event: NewEvent) -> Result<Event, StoreError> {
+        let lease = self.lease(&event.session_id).await?;
+        let appended = self.inner.store.append(event, &lease).await;
+        if matches!(appended, Err(StoreError::Fenced)) {
+            let mut leases = self.inner.leases.lock().await;
+            if leases.get(&lease.session_id) == Some(&lease) {
+                leases.remove(&lease.session_id);
+            }
+        }
+        appended
+    }
+
+    async fn lease(&self, session: &str) -> Result<Lease, StoreError> {
+        let mut leases = self.inner.leases.lock().await;
+        if let Some(lease) = leases.get(session) {
+            return Ok(lease.clone());
+        }
+        let lease = self
+            .inner
+            .store
+            .acquire_lease(session, &self.inner.owner, self.inner.lease_ttl)
+            .await?;
+        leases.insert(session.to_owned(), lease.clone());
+        Ok(lease)
     }
 
     /// The core rule of the log: the request is committed before the tool can run,
@@ -92,44 +143,48 @@ impl Gateway {
         params: CallToolRequestParams,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool = params.name.to_string();
-        let store = &self.inner.store;
+        let arguments = json!(params.arguments);
 
         let effect = self.effect_of(&tool).await;
         let request_payload =
             json!({ "rpc_id": rpc_id, "meta": meta, "effect": effect, "params": params });
-        let request = store
-            .append(NewEvent::request(session, &tool, request_payload))
+        let request = self
+            .append(NewEvent::request(
+                session,
+                &tool,
+                &arguments,
+                request_payload,
+            ))
             .await
             .map_err(|e| {
                 tracing::error!(session, tool, error = %e, "could not record request");
                 ErrorData::new(
                     error_codes::NOT_RECORDED,
-                    "ledger could not record this call, so it was not forwarded",
+                    format!("ledger could not record this call, so it was not forwarded: {e}"),
                     None,
                 )
             })?;
 
         let forwarded = self.forward(params).await;
         let (outcome, response_payload) = describe(&forwarded);
-        store
-            .append(NewEvent::response(
-                session,
-                request.seq,
-                &tool,
-                outcome,
-                response_payload,
-            ))
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    session, tool, seq = request.seq, error = %e, "could not record response"
-                );
-                ErrorData::new(
-                    error_codes::OUTCOME_NOT_RECORDED,
-                    "the tool may have run, but ledger could not record the outcome",
-                    None,
-                )
-            })?;
+        self.append(NewEvent::response(
+            session,
+            request.seq,
+            &tool,
+            outcome,
+            response_payload,
+        ))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                session, tool, seq = request.seq, error = %e, "could not record response"
+            );
+            ErrorData::new(
+                error_codes::OUTCOME_NOT_RECORDED,
+                "the tool may have run, but ledger could not record the outcome",
+                None,
+            )
+        })?;
 
         self.agent_view(forwarded, &tool)
     }

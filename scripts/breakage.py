@@ -21,6 +21,8 @@ GATEWAY = "crates/ledger-gateway/src/gateway.rs"
 GATEWAY_MAIN = "crates/ledger-gateway/src/main.rs"
 POLICY = "crates/ledger-gateway/src/policy.rs"
 MIGRATION = "crates/ledger-store/migrations/0001_event_log.sql"
+LEASES = "crates/ledger-store/migrations/0002_leases.sql"
+EVENT = "crates/ledger-store/src/event.rs"
 STORE = "crates/ledger-store/src/postgres.rs"
 PORT = "crates/ledger-testkit/src/port.rs"
 UPSTREAM = "crates/ledger-gateway/src/upstream.rs"
@@ -319,6 +321,73 @@ FAULTS = [
         "a_bad_override_file_stops_the_binary_with_a_useful_message",
         GATEWAY_MAIN,
         [("let policy = config.effect_policy()?;", "let policy = config.effect_policy().unwrap_or_default();")],
+    ),
+    Fault(
+        "fencing: an append ignores its token",
+        "an_append_with_a_stale_token_is_rejected",
+        STORE,
+        [("        WHERE session_id = $1 AND token = $8\n", "        WHERE session_id = $1\n")],
+    ),
+    Fault(
+        "fencing: a takeover keeps the old token",
+        "an_append_with_a_stale_token_is_rejected",
+        STORE,
+        [("token = leases.token + 1,", "token = leases.token,")],
+    ),
+    Fault(
+        "fencing: a lease can be taken before it expires",
+        "a_lease_that_has_not_expired_cannot_be_taken",
+        STORE,
+        [("        WHERE leases.expires_at <= now() OR leases.owner = excluded.owner\n", "")],
+    ),
+    Fault(
+        "fencing: appending does not extend the lease",
+        "appending_extends_the_lease",
+        STORE,
+        [("UPDATE leases SET expires_at = now() + make_interval(secs => $9)", "UPDATE leases SET expires_at = expires_at + make_interval(secs => 0 * $9)")],
+    ),
+    Fault(
+        "fencing: a fenced append uses up a sequence number",
+        "an_append_with_a_stale_token_is_rejected",
+        STORE,
+        [
+            (
+                """    ), bumped AS (
+        INSERT INTO sessions (session_id, last_seq) SELECT $1, 1 FROM fence
+        ON CONFLICT (session_id) DO UPDATE SET last_seq = sessions.last_seq + 1
+        RETURNING last_seq
+    )
+    INSERT INTO events
+        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token)
+    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8 FROM bumped""",
+                """    ), bumped AS (
+        INSERT INTO sessions (session_id, last_seq) VALUES ($1, 1)
+        ON CONFLICT (session_id) DO UPDATE SET last_seq = sessions.last_seq + 1
+        RETURNING last_seq
+    )
+    INSERT INTO events
+        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token)
+    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8 FROM bumped, fence""",
+            )
+        ],
+    ),
+    Fault(
+        "fencing: events need no fence token",
+        "the_schema_refuses_malformed_events",
+        LEASES,
+        [("    ADD CONSTRAINT events_carry_a_fence_token CHECK (fence_token IS NOT NULL) NOT VALID,\n", "")],
+    ),
+    Fault(
+        "fencing: the arguments hash ignores the arguments",
+        "the_arguments_hash_ignores_key_order_and_nothing_else",
+        EVENT,
+        [('format!("{:x}", Sha256::digest(arguments.to_string()))', 'format!("{:x}", Sha256::digest(arguments.is_object().to_string()))')],
+    ),
+    Fault(
+        "fencing: the gateway takes a session another copy holds",
+        "a_copy_cannot_record_in_a_session_another_copy_holds",
+        STORE,
+        [("        WHERE leases.expires_at <= now() OR leases.owner = excluded.owner\n", "")],
     ),
 ]
 

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ledger_gateway::{Gateway, McpUpstream, Upstream};
-use ledger_store::{Event, EventKind, EventStore, NewEvent, SessionSummary, StoreError};
+use ledger_store::{Event, EventKind, EventStore, Lease, NewEvent, SessionSummary, StoreError};
 use ledger_testkit::PATIENCE;
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
@@ -104,11 +104,20 @@ impl FaultyStore {
 
 #[async_trait]
 impl EventStore for FaultyStore {
-    async fn append(&self, event: NewEvent) -> Result<Event, StoreError> {
+    async fn acquire_lease(
+        &self,
+        session_id: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Lease, StoreError> {
+        self.inner.acquire_lease(session_id, owner, ttl).await
+    }
+
+    async fn append(&self, event: NewEvent, lease: &Lease) -> Result<Event, StoreError> {
         if *self.fail_kind.lock().await == Some(event.kind) {
             return Err(StoreError::Database(sqlx::Error::PoolTimedOut));
         }
-        self.inner.append(event).await
+        self.inner.append(event, lease).await
     }
 
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError> {

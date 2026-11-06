@@ -75,6 +75,7 @@ async fn the_binary_serves_records_and_survives_being_killed() {
             listen = "{addr}"
             call_timeout_secs = {patience}
             connect_timeout_secs = {patience}
+            lease_secs = 0
             [[upstream]]
             name = "email"
             url = "{email_url}"
@@ -167,6 +168,7 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
             listen = "{addr}"
             call_timeout_secs = {patience}
             connect_timeout_secs = {patience}
+            lease_secs = 0
             [[upstream]]
             name = "probe"
             url = "{probe_url}"

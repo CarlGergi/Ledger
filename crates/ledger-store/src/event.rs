@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::StoreError;
 
@@ -71,6 +72,13 @@ impl Outcome {
     }
 }
 
+/// A SHA-256 of the arguments in a canonical form: object keys sorted, no whitespace.
+/// Arguments that differ only in key order or spacing hash the same; `1` and `1.0` do not.
+pub fn args_hash(arguments: &Value) -> String {
+    // serde_json keeps object keys sorted, so its compact output is already canonical.
+    format!("{:x}", Sha256::digest(arguments.to_string()))
+}
+
 /// An event waiting to be appended. The store assigns its sequence number.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
@@ -79,17 +87,20 @@ pub struct NewEvent {
     pub request_seq: Option<i64>,
     pub tool: String,
     pub outcome: Option<Outcome>,
+    /// For requests only, from [`args_hash`].
+    pub args_hash: Option<String>,
     pub payload: Value,
 }
 
 impl NewEvent {
-    pub fn request(session_id: &str, tool: &str, payload: Value) -> Self {
+    pub fn request(session_id: &str, tool: &str, arguments: &Value, payload: Value) -> Self {
         Self {
             session_id: session_id.to_owned(),
             kind: EventKind::CallRequest,
             request_seq: None,
             tool: tool.to_owned(),
             outcome: None,
+            args_hash: Some(args_hash(arguments)),
             payload,
         }
     }
@@ -107,6 +118,7 @@ impl NewEvent {
             request_seq: Some(request_seq),
             tool: tool.to_owned(),
             outcome: Some(outcome),
+            args_hash: None,
             payload,
         }
     }
@@ -120,6 +132,9 @@ pub struct Event {
     pub request_seq: Option<i64>,
     pub tool: String,
     pub outcome: Option<Outcome>,
+    pub args_hash: Option<String>,
+    /// The token of the lease it was appended under. None for events from before leases.
+    pub fence_token: Option<i64>,
     pub payload: Value,
     pub recorded_at: DateTime<Utc>,
 }

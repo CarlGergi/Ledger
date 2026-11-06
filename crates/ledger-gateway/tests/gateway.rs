@@ -625,14 +625,20 @@ async fn a_session_continues_across_a_gateway_restart() {
             json!({"path": "f.txt", "content": "x"}),
         )
     };
+    let copy = || {
+        let upstreams = vec![upstream("files", &harness.files_url)];
+        // Its lease lapses at once, as a crashed copy's eventually does.
+        Gateway::new(store.clone(), upstreams, CALL_TIMEOUT).with_lease_ttl(Duration::ZERO)
+    };
 
-    let agent = connect(&harness.url, Some("s")).await.unwrap();
+    let agent = connect(&spawn_gateway(copy()).await, Some("s"))
+        .await
+        .unwrap();
     agent.call_tool(write()).await.unwrap();
     drop(agent);
 
     // A second copy with nothing in memory picks the sequence up from the log.
-    let upstreams = vec![upstream("files", &harness.files_url)];
-    let url = spawn_gateway(Gateway::new(store.clone(), upstreams, CALL_TIMEOUT)).await;
+    let url = spawn_gateway(copy()).await;
     let agent = connect(&url, Some("s")).await.unwrap();
     agent.call_tool(write()).await.unwrap();
 
