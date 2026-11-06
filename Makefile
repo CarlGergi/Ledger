@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage interop demo stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage interop soak demo stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -8,6 +8,7 @@ help:
 	@echo "make test       run every test"
 	@echo "make breakage   break each guarantee and check that a test notices"
 	@echo "make interop    drive the gateway with the official TypeScript MCP client"
+	@echo "make soak       repeat the test suite under load, about 30 minutes; not part of reproduce"
 	@echo "make demo       run the sample agent and print its log"
 	@echo "make stack      run the gateway and tool servers until interrupted"
 	@echo "make sessions   list recorded sessions"
@@ -37,6 +38,9 @@ breakage: db-up
 interop: db-up
 	npm ci --silent --prefix interop/typescript
 	scripts/with-stack.sh node interop/typescript/client.mjs
+
+soak: db-up
+	python3 scripts/soak.py
 
 demo: db-up
 	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
