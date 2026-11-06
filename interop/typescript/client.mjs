@@ -10,9 +10,11 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const url = new URL(process.env.LEDGER_URL ?? "http://127.0.0.1:7100/mcp");
 const transport = new StreamableHTTPClientTransport(url);
 const client = new Client({ name: "interop-check", version: "1.0.0" });
-await client.connect(transport);
+// Far beyond what a loaded machine needs, so that only a real failure reaches it.
+const patience = { timeout: 120_000 };
+await client.connect(transport, patience);
 
-const { tools } = await client.listTools();
+const { tools } = await client.listTools(undefined, patience);
 const byName = new Map(tools.map((tool) => [tool.name, tool]));
 assert.ok(byName.has("email__send_email"), "email tools are listed");
 assert.ok(byName.has("files__write_file"), "file tools are listed");
@@ -28,14 +30,14 @@ const calls = [
 ];
 const results = [];
 for (const [name, args] of calls) {
-  const result = await client.callTool({ name, arguments: args });
+  const result = await client.callTool({ name, arguments: args }, undefined, patience);
   assert.notEqual(result.isError, true, `${name} failed`);
   results.push(result);
 }
 assert.equal(results[1].structuredContent.content, stamp, "the file reads back");
 
 const refused = await client
-  .callTool({ name: "files__write_file", arguments: { path: "../escape", content: "x" } })
+  .callTool({ name: "files__write_file", arguments: { path: "../escape", content: "x" } }, undefined, patience)
   .then((result) => result.isError);
 assert.equal(refused, true, "tool errors reach the client as tool errors");
 

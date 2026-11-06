@@ -3,23 +3,25 @@ mod common;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{
     CALL_TIMEOUT, FaultyStore, Harness, Probe, eventually, spawn_gateway, spawn_tool_server,
     upstream,
 };
-use ledger_gateway::{Gateway, error_codes};
+use ledger_gateway::{Gateway, McpUpstream, Upstream, error_codes};
 use ledger_store::{Event, EventKind, EventStore, Outcome, PgEventStore};
-use ledger_testkit::{ReservedPort, TestDb};
+use ledger_testkit::{PATIENCE, ReservedPort, TestDb};
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::http::serve_mcp;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientConfig, ErrorCode, ProtocolVersion,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+    ClientConfig, ErrorCode, ProtocolVersion, ServerConfig,
 };
+use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{ClientLifecycleMode, ClientServiceExt, ServiceError};
+use rmcp::{ClientLifecycleMode, ClientServiceExt, ServerHandler, ServiceError};
 use sample_agent::{call_params, connect, run_script};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -99,6 +101,36 @@ impl RestartableEmailServer {
             listener,
             self.shutdown.clone(),
         ));
+    }
+}
+
+/// A gateway that shows a test when a cancellation has reached it. The SDK cancels a
+/// request before it calls `on_cancelled`.
+#[derive(Clone)]
+struct CancellationWatcher {
+    gateway: Gateway,
+    cancellations: Arc<AtomicUsize>,
+}
+
+impl ServerHandler for CancellationWatcher {
+    fn get_info(&self) -> ServerConfig {
+        self.gateway.get_info()
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        self.gateway.call_tool(request, context).await
+    }
+
+    async fn on_cancelled(
+        &self,
+        _notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -406,7 +438,14 @@ async fn an_agent_cancelling_a_call_does_not_lose_the_outcome() {
     let db = TestDb::new().await;
     let pool = db.pool();
     let store = pg(pool);
-    let (url, probe) = probe_gateway(store.clone(), "s", CALL_TIMEOUT).await;
+    let probe = Probe::new(store.clone(), "s");
+    let probe_url = spawn_tool_server(probe.clone()).await;
+    let upstreams = vec![upstream("probe", &probe_url)];
+    let watcher = CancellationWatcher {
+        gateway: Gateway::new(store.clone(), upstreams, CALL_TIMEOUT),
+        cancellations: Arc::default(),
+    };
+    let url = spawn_tool_server(watcher.clone()).await;
     let agent = connect(&url, Some("s")).await.unwrap();
 
     // Dropping the pending call sends a cancellation while the connection stays up.
@@ -418,8 +457,8 @@ async fn an_agent_cancelling_a_call_does_not_lose_the_outcome() {
             _ = probe.wait_until_started() => {}
         }
     }
-    // Give the cancellation time to reach the gateway before the tool finishes.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // From here on the gateway's request is cancelled, and the tool is still running.
+    eventually(|| async { watcher.cancellations.load(Ordering::SeqCst) > 0 }).await;
 
     probe.release();
 
@@ -691,9 +730,34 @@ async fn a_tool_server_that_never_answers_cannot_stall_the_gateway() {
     assert_eq!(error.code, error_codes::OUTCOME_UNKNOWN);
     let events = store.session_events("s").await.unwrap();
     assert_well_formed(&events);
-    // `timeout`, not `transport_error`: the call's own limit fired, well before the
-    // upstream connection attempt gave up.
+    // `timeout`, not `transport_error`: the call's own limit fired, and the connection
+    // attempt has a much longer one here.
     assert_eq!(events[1].outcome, Some(Outcome::Timeout));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_attempt_gives_up_on_its_own() {
+    let db = TestDb::new().await;
+    let store = pg(db.pool());
+    let black_hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", black_hole.local_addr().unwrap());
+    let hole: Arc<dyn Upstream> =
+        Arc::new(McpUpstream::new("hole", url, Duration::from_millis(200)));
+    let gateway = Gateway::new(store.clone(), vec![hole], CALL_TIMEOUT);
+    let url = spawn_gateway(gateway).await;
+    let agent = connect(&url, Some("s")).await.unwrap();
+
+    let error = rpc_error(
+        agent
+            .call_tool(call_params("hole__anything", json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(error.code, error_codes::OUTCOME_UNKNOWN);
+    let events = store.session_events("s").await.unwrap();
+    assert_well_formed(&events);
+    // `transport_error`, not `timeout`: the connection limit fired, not the call's own.
+    assert_eq!(events[1].outcome, Some(Outcome::TransportError));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -709,7 +773,7 @@ async fn a_tool_server_that_stalls_on_listing_cannot_stall_the_gateway() {
     let url = spawn_gateway(gateway).await;
     let agent = connect(&url, Some("s")).await.unwrap();
 
-    let tools = tokio::time::timeout(Duration::from_secs(30), agent.list_all_tools())
+    let tools = tokio::time::timeout(PATIENCE, agent.list_all_tools())
         .await
         .expect("listing tools must not hang")
         .unwrap();

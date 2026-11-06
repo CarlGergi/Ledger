@@ -12,8 +12,13 @@ pub struct Config {
     pub listen: String,
     /// Used when the `DATABASE_URL` environment variable is not set.
     pub database_url: Option<String>,
+    /// How long a call waits for its tool, or for a connection to the database.
     #[serde(default = "default_call_timeout_secs")]
     pub call_timeout_secs: u64,
+    /// How long a tool server has to accept a new connection. Separate because listing
+    /// tools waits for every server, so one dead server should not cost a whole call's limit.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
     /// Extra `Host` values to accept. Empty means loopback only.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
@@ -36,6 +41,10 @@ fn default_call_timeout_secs() -> u64 {
     60
 }
 
+fn default_connect_timeout_secs() -> u64 {
+    5
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
@@ -53,10 +62,18 @@ impl Config {
         Duration::from_secs(self.call_timeout_secs)
     }
 
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs)
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             self.call_timeout_secs > 0,
             "call_timeout_secs must be positive"
+        );
+        ensure!(
+            self.connect_timeout_secs > 0,
+            "connect_timeout_secs must be positive"
         );
         ensure!(
             !self.upstreams.is_empty(),
@@ -96,6 +113,7 @@ mod tests {
         let config = Config::parse(UPSTREAMS).unwrap();
         assert_eq!(config.listen, "127.0.0.1:7100");
         assert_eq!(config.call_timeout(), Duration::from_secs(60));
+        assert_eq!(config.connect_timeout(), Duration::from_secs(5));
         assert_eq!(config.database_url, None);
         assert!(config.allowed_hosts.is_empty());
         assert_eq!(config.upstreams[0].name, "email");
@@ -108,6 +126,7 @@ mod tests {
             listen = "0.0.0.0:9000"
             database_url = "postgres://db/ledger"
             call_timeout_secs = 5
+            connect_timeout_secs = 7
             allowed_hosts = ["ledger.example.com"]
             {UPSTREAMS}
             "#
@@ -116,6 +135,7 @@ mod tests {
         assert_eq!(config.listen, "0.0.0.0:9000");
         assert_eq!(config.database_url.as_deref(), Some("postgres://db/ledger"));
         assert_eq!(config.call_timeout(), Duration::from_secs(5));
+        assert_eq!(config.connect_timeout(), Duration::from_secs(7));
         assert_eq!(config.allowed_hosts, ["ledger.example.com"]);
     }
 
@@ -124,11 +144,13 @@ mod tests {
         let upstream = |name: &str| format!("[[upstream]]\nname = {name:?}\nurl = \"http://x\"\n");
         let twice = upstream("a") + &upstream("a");
         let zero_timeout = format!("call_timeout_secs = 0\n{UPSTREAMS}");
+        let zero_connect = format!("connect_timeout_secs = 0\n{UPSTREAMS}");
         let unknown_field = format!("listn = \"oops\"\n{UPSTREAMS}");
         for text in [
             String::new(),
             twice,
             zero_timeout,
+            zero_connect,
             unknown_field,
             upstream(""),
             upstream("a__b"),

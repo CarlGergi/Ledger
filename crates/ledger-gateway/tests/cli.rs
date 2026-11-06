@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::{Probe, eventually, spawn_tool_server};
 use ledger_store::{EventKind, EventStore, Outcome, PgEventStore};
-use ledger_testkit::{ReservedPort, TestDb};
+use ledger_testkit::{PATIENCE, ReservedPort, TestDb};
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
 use sample_agent::{call_params, connect, run_script};
@@ -65,12 +65,15 @@ async fn the_binary_serves_records_and_survives_being_killed() {
 
     let port = ReservedPort::claim();
     let addr = port.addr();
+    let patience = PATIENCE.as_secs();
     let config = dir.path().join("ledger.toml");
     std::fs::write(
         &config,
         format!(
             r#"
             listen = "{addr}"
+            call_timeout_secs = {patience}
+            connect_timeout_secs = {patience}
             [[upstream]]
             name = "email"
             url = "{email_url}"
@@ -153,12 +156,15 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
 
     let port = ReservedPort::claim();
     let addr = port.addr();
+    let patience = PATIENCE.as_secs();
     let config = dir.path().join("ledger.toml");
     std::fs::write(
         &config,
         format!(
             r#"
             listen = "{addr}"
+            call_timeout_secs = {patience}
+            connect_timeout_secs = {patience}
             [[upstream]]
             name = "probe"
             url = "{probe_url}"

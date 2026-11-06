@@ -21,7 +21,8 @@ GATEWAY = "crates/ledger-gateway/src/gateway.rs"
 MIGRATION = "crates/ledger-store/migrations/0001_event_log.sql"
 STORE = "crates/ledger-store/src/postgres.rs"
 PORT = "crates/ledger-testkit/src/port.rs"
-TEST_TIMEOUT_SECS = 300
+UPSTREAM = "crates/ledger-gateway/src/upstream.rs"
+TEST_TIMEOUT_SECS = 1800
 
 
 @dataclass
@@ -144,7 +145,7 @@ FAULTS = [
         [
             (
                 "tokio::time::timeout(timeout, upstream.list_tools())",
-                "tokio::time::timeout(timeout * 500, upstream.list_tools())",
+                "tokio::time::timeout(timeout * 1000, upstream.list_tools())",
             )
         ],
     ),
@@ -208,6 +209,17 @@ FAULTS = [
     WHERE request_seq IS NOT NULL;
 """,
                 "",
+            )
+        ],
+    ),
+    Fault(
+        "connecting to a tool server has no limit of its own",
+        "a_connection_attempt_gives_up_on_its_own",
+        UPSTREAM,
+        [
+            (
+                "tokio::time::timeout(self.connect_timeout, client.serve(transport))",
+                "tokio::time::timeout(self.connect_timeout * 5000, client.serve(transport))",
             )
         ],
     ),

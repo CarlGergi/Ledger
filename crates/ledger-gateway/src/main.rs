@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -8,6 +9,9 @@ use ledger_store::{Event, EventStore, PgEventStore};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+/// One-shot commands have nothing waiting on them, and can always be interrupted.
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
 #[command(name = "ledger", about = "Crash-safe MCP gateway for AI agents")]
@@ -50,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve { config } => serve(Config::load(&config)?).await,
         Command::Sessions { database_url } => {
-            let store = PgEventStore::connect(&database_url).await?;
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
             for session in store.sessions().await? {
                 println!(
                     "{}  {:>6} events  {}",
@@ -66,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
             database_url,
             json,
         } => {
-            let store = PgEventStore::connect(&database_url).await?;
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
             let events = store.session_events(&session).await?;
             anyhow::ensure!(!events.is_empty(), "no events for session {session:?}");
             for event in &events {
@@ -86,7 +90,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .ok()
         .or_else(|| config.database_url.clone())
         .context("set DATABASE_URL or database_url in the config")?;
-    let store = PgEventStore::connect(&database_url)
+    let store = PgEventStore::connect(&database_url, config.call_timeout())
         .await
         .context("connecting to the event store")?;
     store.migrate().await.context("migrating the event store")?;
@@ -94,7 +98,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let upstreams = config
         .upstreams
         .iter()
-        .map(|u| Arc::new(McpUpstream::new(&u.name, &u.url)) as Arc<dyn Upstream>)
+        .map(|u| {
+            Arc::new(McpUpstream::new(&u.name, &u.url, config.connect_timeout()))
+                as Arc<dyn Upstream>
+        })
         .collect();
     let gateway = Gateway::new(Arc::new(store), upstreams, config.call_timeout());
 

@@ -10,8 +10,6 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ErrorData, ServiceExt};
 use tokio::sync::Mutex;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
     /// The server answered with a JSON-RPC error.
@@ -42,14 +40,16 @@ type Connection = RunningService<RoleClient, ClientConfig>;
 pub struct McpUpstream {
     name: String,
     url: String,
+    connect_timeout: Duration,
     connection: Mutex<Option<Arc<Connection>>>,
 }
 
 impl McpUpstream {
-    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, url: impl Into<String>, connect_timeout: Duration) -> Self {
         Self {
             name: name.into(),
             url: url.into(),
+            connect_timeout,
             connection: Mutex::new(None),
         }
     }
@@ -65,7 +65,7 @@ impl McpUpstream {
         let mut client = ClientConfig::default();
         client.client_info = Implementation::new("ledger", env!("CARGO_PKG_VERSION"));
         let transport = StreamableHttpClientTransport::from_uri(self.url.clone());
-        let connection = tokio::time::timeout(CONNECT_TIMEOUT, client.serve(transport))
+        let connection = tokio::time::timeout(self.connect_timeout, client.serve(transport))
             .await
             .map_err(|_| UpstreamError::Transport(format!("connecting to {} timed out", self.url)))?
             .map_err(|e| UpstreamError::Transport(format!("connecting to {}: {e}", self.url)))?;

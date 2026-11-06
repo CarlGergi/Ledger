@@ -49,6 +49,7 @@ impl TestDb {
 
         let pool = PgPoolOptions::new()
             .max_connections(POOL_SIZE)
+            .acquire_timeout(crate::PATIENCE)
             .connect_with(server.clone().database(&name))
             .await
             .expect("could not connect to the test database");

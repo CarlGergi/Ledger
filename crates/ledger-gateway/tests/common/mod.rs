@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use ledger_gateway::{Gateway, McpUpstream, Upstream};
 use ledger_store::{Event, EventKind, EventStore, NewEvent, SessionSummary, StoreError};
+use ledger_testkit::PATIENCE;
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
 use ledger_tools::http::serve_mcp;
@@ -20,10 +21,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const CALL_TIMEOUT: Duration = PATIENCE;
 
 pub fn upstream(name: &str, url: &str) -> Arc<dyn Upstream> {
-    Arc::new(McpUpstream::new(name, url))
+    Arc::new(McpUpstream::new(name, url, PATIENCE))
 }
 
 /// Starts a tool server on an ephemeral port and returns its URL.
@@ -208,15 +209,13 @@ impl ServerHandler for Probe {
     }
 }
 
-/// Waits for something that happens after a response has returned. The limit only
-/// decides how long a real failure takes to report, so it is set well above what a
-/// heavily loaded machine needs; a passing test never waits for it.
+/// Waits for something that happens after a response has returned.
 pub async fn eventually<F, Fut>(check: F)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + PATIENCE;
     while Instant::now() < deadline {
         if check().await {
             return;

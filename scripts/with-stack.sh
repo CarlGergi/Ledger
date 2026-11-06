@@ -33,7 +33,7 @@ target/debug/ledger serve --config config/ledger.toml >var/ledger.log 2>&1 &
 gateway=$!
 pids+=("$gateway")
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 1200); do
     kill -0 "$gateway" 2>/dev/null || break
     if listening 7100; then
         "$@"

@@ -90,7 +90,8 @@ The gateway reads a TOML file; see [`config/ledger.toml`](config/ledger.toml).
 | --- | --- | --- |
 | `listen` | `127.0.0.1:7100` | Address to serve on |
 | `database_url` | none | Used when `DATABASE_URL` is not set |
-| `call_timeout_secs` | `60` | How long to wait for a tool server |
+| `call_timeout_secs` | `60` | How long a call waits for its tool, or for a database connection |
+| `connect_timeout_secs` | `5` | How long a tool server has to accept a new connection |
 | `allowed_hosts` | loopback only | `Host` values to accept |
 | `[[upstream]]` | none | A tool server: `name` and `url` |
 
@@ -118,6 +119,8 @@ make log SESSION=<id>
 Each database test gets its own randomly named database, so test runs can overlap on one server, as long as each has its own `CARGO_TARGET_DIR`: even with nothing to build, `cargo test` relinks the binaries that another run's tests may be starting. A killed test run can leave databases behind; `make db-reset` clears them, along with all recorded sessions.
 
 A test that restarts a server reserves its port from below the range the kernel hands out by itself, so while the server is down, connections are refused and nothing else can be given the port.
+
+No test needs real work to finish inside a limit a loaded machine could miss. Limits on real work are 120 seconds, which only a failing test reaches, and short limits appear only on things that never answer, where firing late cannot change the result.
 
 ## Layout
 

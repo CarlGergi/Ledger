@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -31,9 +33,14 @@ impl PgEventStore {
         Self { pool }
     }
 
-    pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+    /// `acquire_timeout` is how long an append may wait for a connection before failing.
+    pub async fn connect(
+        database_url: &str,
+        acquire_timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(16)
+            .acquire_timeout(acquire_timeout)
             .connect(database_url)
             .await?;
         Ok(Self::new(pool))
