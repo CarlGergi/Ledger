@@ -26,6 +26,7 @@ LEASES = "crates/ledger-store/migrations/0002_leases.sql"
 RETRIES = "crates/ledger-store/migrations/0003_retries.sql"
 EVENT = "crates/ledger-store/src/event.rs"
 MEMORY = "crates/ledger-store/src/memory.rs"
+SIM_TEST = "the_first_seeds_keep_every_invariant"
 STORE = "crates/ledger-store/src/postgres.rs"
 PORT = "crates/ledger-testkit/src/port.rs"
 UPSTREAM = "crates/ledger-gateway/src/upstream.rs"
@@ -476,6 +477,62 @@ FAULTS = [
 """,
             )
         ],
+    ),
+    # The simulator must catch real bugs, not merely run without complaint.
+    Fault(
+        "sim: an unsafe call in doubt runs again",
+        SIM_TEST,
+        GATEWAY,
+        [("            EffectClass::ReadOnly | EffectClass::Idempotent => {\n", "            EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::AtMostOnce => {\n")],
+    ),
+    Fault(
+        "sim: a takeover leaves open calls unflagged",
+        SIM_TEST,
+        GATEWAY,
+        [("        self.flag_open_calls(&lease).await?;\n", "")],
+    ),
+    Fault(
+        "sim: a keyed retry gets a new key",
+        SIM_TEST,
+        GATEWAY,
+        [("let key = Some((param, key_for(session, request.seq)));", "let key = Some((param, key_for(session, request.seq + 1)));")],
+    ),
+    Fault(
+        "sim: a step does not identify a retry",
+        SIM_TEST,
+        DEDUP,
+        [("    if let Some(step) = call.step {\n", "    if let Some(step) = call.step.filter(|_| false) {\n")],
+    ),
+    Fault(
+        "sim: the store ignores fencing",
+        SIM_TEST,
+        MEMORY,
+        [("            Some(row) if row.token == lease.token => {}\n            _ => return Err(StoreError::Fenced),", "            Some(_) => {}\n            _ => return Err(StoreError::Fenced),")],
+    ),
+    Fault(
+        "sim: a result is released though not logged",
+        SIM_TEST,
+        GATEWAY,
+        [
+            (
+                """            return Err(ErrorData::new(
+                error_codes::OUTCOME_NOT_RECORDED,
+                "the tool may have run, but ledger could not record the outcome",
+                None,
+            ));""",
+                """            let _ = ErrorData::new(
+                error_codes::OUTCOME_NOT_RECORDED,
+                "the tool may have run, but ledger could not record the outcome",
+                None,
+            );""",
+            )
+        ],
+    ),
+    Fault(
+        "sim: a lying tool's override is ignored",
+        SIM_TEST,
+        POLICY,
+        [("if let Some(entry) = self.overrides.get(name) {", "if let Some(entry) = self.overrides.get(name).filter(|_| name.is_empty()) {")],
     ),
 ]
 

@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage interop soak demo stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop soak demo stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -7,6 +7,7 @@ help:
 	@echo "make lint       check formatting and run clippy"
 	@echo "make test       run every test"
 	@echo "make breakage   break each guarantee and check that a test notices"
+	@echo "make simulate   run 10,000 seeds of the deterministic simulation"
 	@echo "make interop    drive the gateway with the official TypeScript MCP client"
 	@echo "make soak       repeat the test suite under load, about 30 minutes; not part of reproduce"
 	@echo "make demo       run the sample agent and print its log"
@@ -35,6 +36,9 @@ test: db-up
 breakage: db-up
 	python3 scripts/breakage.py
 
+simulate:
+	cargo run --quiet --release -p ledger-sim -- --seeds 10000
+
 interop: db-up
 	npm ci --silent --prefix interop/typescript
 	scripts/with-stack.sh node interop/typescript/client.mjs
@@ -55,7 +59,7 @@ sessions:
 log:
 	cargo run --quiet --package ledger-gateway --bin ledger -- log $(SESSION)
 
-reproduce: lint test breakage interop
+reproduce: lint test breakage simulate interop
 
 clean:
 	cargo clean

@@ -162,12 +162,55 @@ While a call runs, the copy renews its lease every quarter of `lease_secs`, so a
 
 Fencing protects the log, not the outside world. A copy that logged a request and then paused can still forward it when it wakes. What keeps that safe is the in-doubt rule above: the copy that takes over never runs such a call again unless its class says that is safe.
 
+## Simulation
+
+`make simulate` runs 10,000 seeds of a deterministic simulation. Each seed sets up three gateway copies sharing one store, a tool server, and two to five agents, all in one thread. Every random choice comes from one generator seeded by the seed, and every timer runs in simulated time. So a seed replays exactly, and a failing one prints the command that replays it with a full trace:
+
+```bash
+cargo run --release -p ledger-sim -- --seed <n> --trace
+```
+
+The gateway is the real one, driven through `Gateway::call`. The store is the in-memory store, which `crates/ledger-store/tests/conformance.rs` holds to the PostgreSQL store: one suite runs against both, in CI too, so any difference between them fails a test. The HTTP and MCP transport layer is outside the simulator. The integration tests cover it, against real servers.
+
+**Faults injected,** at rates each seed scales by a factor from 0.5 to 4:
+
+- copies killed at any point, including just after a write and before learning it succeeded
+- copies paused for longer than their lease, then woken still believing they own their sessions
+- writes that fail, and writes that commit but whose acknowledgement is lost
+- requests lost, delayed or duplicated on the way to a copy, and answers lost on the way back
+- tool servers that refuse connections, hang, or run the tool and lose the answer
+- a tool that claims to be read-only but is not, corrected by the override file, and another that is not corrected
+
+Agents come in three kinds: ones that number their steps, ones that resend with the same request id, and ones that resend with a new id and no step.
+
+**Invariants checked after every run,** once a healthy copy has taken every session over:
+
+1. Every session's log is gapless, every answer and retry links to an earlier call of the same tool, no call has two final answers, and fencing tokens never go backwards along the log.
+2. Nothing that is not safe to repeat is left without a final answer.
+3. No at-most-once or keyed effect happens twice, for agents ledger can recognise.
+4. A call flagged as in doubt never runs again.
+5. Every answer an agent was given is in the log.
+6. A call whose outcome went unrecorded (`-32051`) never runs again if it is not safe to repeat.
+
+Repeats from agents that resend with a new id, and from the uncorrected lying tool, are counted rather than treated as failures. They are the documented limits: ledger cannot tell such a resend from a new call, and cannot know a tool lies unless told.
+
+`make breakage` also checks the simulator itself, by injecting seven bugs into the gateway and store and requiring the seed test to catch each.
+
+Results of `make simulate`, which takes a few seconds:
+
+| Seeds | Failed | Calls | Retries | Tool effects | Takeovers | Flagged in doubt | Repeats from new-id resends | Repeats from the uncorrected lie |
+| --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| 10,000 | 0 | 197,532 | 21,573 | 187,885 | 106,046 | 9,570 | 3,384 | 752 |
+
+The simulator has not found a bug in Ledger itself. What it did find was a blind spot of its own: its step-numbering agents never reconnected, so rule 2 caught their retries whatever rule 1 did. Its own check against injected bugs is what showed this.
+
 ## Testing
 
 | Command | What it does |
 | --- | --- |
 | `make test` | Runs every test against real PostgreSQL |
 | `make breakage` | Breaks each guarantee in turn and checks that the test protecting it fails |
+| `make simulate` | Runs 10,000 seeds of the deterministic simulation |
 | `make interop` | Drives the gateway with the official TypeScript MCP client, configured only with a URL |
 | `make reproduce` | Runs all of the above, plus lint |
 | `make soak` | Repeats the whole suite under load, and fails on any failed run, PostgreSQL reset, or leftover database. About 30 minutes on a busy machine, so it is not part of `make reproduce` |
@@ -206,6 +249,7 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 | --- | --- |
 | `crates/ledger-store` | Event model, the `EventStore` trait, PostgreSQL and in-memory stores, migrations, the conformance suite |
 | `crates/ledger-gateway` | The gateway and the `ledger` command |
+| `crates/ledger-sim` | The deterministic simulation |
 | `crates/ledger-testkit` | A private, automatically dropped database and reserved ports for each test |
 | `crates/ledger-tools` | Example tool servers: email and files |
 | `crates/sample-agent` | A scripted MCP client |
@@ -227,7 +271,7 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 
 1. ~~Pass-through gateway and event log~~
 2. ~~Effect policy from MCP annotations, deduplication, idempotency keys, leases with fencing tokens~~
-3. Deterministic simulation testing with fault injection
+3. ~~Deterministic simulation testing with fault injection~~
 4. VS Code extension: timeline, inspect, replay
 5. Model proxy, forking a session at any step, regression replay against a new model
 6. Benchmarks, OpenTelemetry, Azure deployment, a real email demo
