@@ -31,6 +31,9 @@ enum Command {
     Sessions {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
+        /// Print sessions as JSON lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a session's events in order.
     Log {
@@ -58,9 +61,13 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Serve { config } => serve(Config::load(&config)?).await,
-        Command::Sessions { database_url } => {
+        Command::Sessions { database_url, json } => {
             let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
             for session in store.sessions().await? {
+                if json {
+                    println!("{}", serde_json::to_string(&session)?);
+                    continue;
+                }
                 println!(
                     "{}  {:>6} events  {}",
                     session.created_at.to_rfc3339(),

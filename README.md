@@ -107,7 +107,25 @@ make sessions
 make log SESSION=<id>
 ```
 
-`ledger log <id> --json` prints full events, including arguments and results, one per line. `ledger in-doubt` lists every call flagged for a person (see below).
+`ledger log <id> --json` prints full events, including arguments and results, one per line, and `ledger sessions --json` lists sessions the same way. `ledger in-doubt` lists every call flagged for a person (see below).
+
+## VS Code extension
+
+`vscode/` holds an extension that reads the log through the `ledger` command:
+
+- **Timeline:** a Ledger view in the activity bar lists sessions, and under each one its calls, each with its status, retries and effect class. Calls flagged as in doubt show a warning icon.
+- **Inspect:** selecting a call opens it as JSON: arguments, step, effect class, every retry and attempt with its idempotency key, and the answer.
+- **Replay:** the play button on a session steps through it one event at a time, showing every call as it stood at that point. Alt+Right and Alt+Left move forward and back.
+
+To install it:
+
+```bash
+make vscode-package
+```
+
+Then run **Extensions: Install from VSIX** on `vscode/out/ledger.vsix`. Set `ledger.command` to the `ledger` binary (for example the full path of `target/debug/ledger`), and `ledger.databaseUrl` if `DATABASE_URL` is not set where VS Code runs.
+
+`make vscode` type-checks it against the VS Code API and tests its logic and its use of the `ledger` command, outside VS Code. Nothing tests it inside a running VS Code yet.
 
 ## Effect classes
 
@@ -212,6 +230,7 @@ The simulator has not found a bug in Ledger itself. What it did find was a blind
 | `make breakage` | Breaks each guarantee in turn and checks that the test protecting it fails |
 | `make simulate` | Runs 10,000 seeds of the deterministic simulation |
 | `make interop` | Drives the gateway with the official TypeScript MCP client, configured only with a URL |
+| `make vscode` | Type-checks and tests the VS Code extension |
 | `make reproduce` | Runs all of the above, plus lint |
 | `make soak` | Repeats the whole suite under load, and fails on any failed run, PostgreSQL reset, or leftover database. About 30 minutes on a busy machine, so it is not part of `make reproduce` |
 
@@ -253,6 +272,7 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 | `crates/ledger-testkit` | A private, automatically dropped database and reserved ports for each test |
 | `crates/ledger-tools` | Example tool servers: email and files |
 | `crates/sample-agent` | A scripted MCP client |
+| `vscode` | The VS Code extension |
 | `interop/typescript` | Interoperability check with the official client |
 | `scripts` | The breakage check, the soak, and a helper that runs the full stack |
 | `.github/workflows` | CI: lint and every test, against PostgreSQL |
@@ -272,6 +292,6 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 1. ~~Pass-through gateway and event log~~
 2. ~~Effect policy from MCP annotations, deduplication, idempotency keys, leases with fencing tokens~~
 3. ~~Deterministic simulation testing with fault injection~~
-4. VS Code extension: timeline, inspect, replay
+4. ~~VS Code extension: timeline, inspect, replay~~
 5. Model proxy, forking a session at any step, regression replay against a new model
 6. Benchmarks, OpenTelemetry, Azure deployment, a real email demo

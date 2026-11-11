@@ -46,3 +46,10 @@ jobs:
         run: cargo test --workspace --locked
       - name: Simulate
         run: cargo run --release --locked -p ledger-sim -- --seeds 10000
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: VS Code extension
+        run: |
+          npm ci --prefix vscode
+          npm test --prefix vscode

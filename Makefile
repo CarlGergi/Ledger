@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop soak demo stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop vscode vscode-package soak demo stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -9,6 +9,8 @@ help:
 	@echo "make breakage   break each guarantee and check that a test notices"
 	@echo "make simulate   run 10,000 seeds of the deterministic simulation"
 	@echo "make interop    drive the gateway with the official TypeScript MCP client"
+	@echo "make vscode     type-check and test the VS Code extension"
+	@echo "make vscode-package  build vscode/out/ledger.vsix to install"
 	@echo "make soak       repeat the test suite under load, about 30 minutes; not part of reproduce"
 	@echo "make demo       run the sample agent and print its log"
 	@echo "make stack      run the gateway and tool servers until interrupted"
@@ -39,6 +41,14 @@ breakage: db-up
 simulate:
 	cargo run --quiet --release -p ledger-sim -- --seeds 10000
 
+vscode:
+	npm ci --silent --prefix vscode
+	npm test --prefix vscode
+
+vscode-package:
+	npm ci --silent --prefix vscode
+	npm run --silent package --prefix vscode
+
 interop: db-up
 	npm ci --silent --prefix interop/typescript
 	scripts/with-stack.sh node interop/typescript/client.mjs
@@ -59,8 +69,8 @@ sessions:
 log:
 	cargo run --quiet --package ledger-gateway --bin ledger -- log $(SESSION)
 
-reproduce: lint test breakage simulate interop
+reproduce: lint test breakage simulate interop vscode
 
 clean:
 	cargo clean
-	rm -rf var interop/typescript/node_modules
+	rm -rf var interop/typescript/node_modules vscode/node_modules vscode/out

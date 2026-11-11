@@ -123,6 +123,12 @@ async fn the_binary_serves_records_and_survives_being_killed() {
     );
     assert_eq!(outbox.sent().await.unwrap().len(), 2);
 
+    let (ok, listed) = ledger_output(&["sessions", "--json"], db_url);
+    assert!(ok);
+    let listed: serde_json::Value = serde_json::from_str(listed.lines().next().unwrap()).unwrap();
+    assert_eq!(listed["session_id"], "run-1");
+    assert_eq!(listed["event_count"], after.len());
+
     let (ok, sessions) = ledger_output(&["sessions"], db_url);
     assert!(ok);
     assert!(sessions.contains("run-1"), "{sessions}");

@@ -1,0 +1,111 @@
+{
+  "name": "ledger-debugger",
+  "displayName": "Ledger",
+  "description": "Browse, inspect and replay the sessions Ledger recorded.",
+  "version": "0.1.0",
+  "publisher": "ledger",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "main": "./out/src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ledger",
+          "title": "Ledger",
+          "icon": "media/ledger.svg"
+        }
+      ]
+    },
+    "views": {
+      "ledger": [
+        {
+          "id": "ledger.sessions",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ledger.refresh",
+        "title": "Ledger: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ledger.inspect",
+        "title": "Ledger: Inspect Call"
+      },
+      {
+        "command": "ledger.replay",
+        "title": "Ledger: Replay Session",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "ledger.replay.next",
+        "title": "Ledger: Replay Next Step"
+      },
+      {
+        "command": "ledger.replay.previous",
+        "title": "Ledger: Replay Previous Step"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "ledger.refresh",
+          "when": "view == ledger.sessions",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "ledger.replay",
+          "when": "view == ledger.sessions && viewItem == session",
+          "group": "inline"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "ledger.replay.next",
+        "key": "alt+right",
+        "when": "ledger.replaying"
+      },
+      {
+        "command": "ledger.replay.previous",
+        "key": "alt+left",
+        "when": "ledger.replaying"
+      }
+    ],
+    "configuration": {
+      "title": "Ledger",
+      "properties": {
+        "ledger.command": {
+          "type": "string",
+          "default": "ledger",
+          "description": "The ledger command, used to read the log."
+        },
+        "ledger.databaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "The log's database. Empty uses the DATABASE_URL environment variable."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test \"out/test/*.test.js\"",
+    "package": "tsc -p . && vsce package --allow-missing-repository --skip-license -o out/ledger.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/vscode": "1.99.1",
+    "@vscode/vsce": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}
