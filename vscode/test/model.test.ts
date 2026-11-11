@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { LedgerEvent, calls, description, inspect, isFinal, replayAt, status } from "../src/model";
+import { LedgerEvent, calls, description, inspect, isFinal, label, replayAt, status } from "../src/model";
 
 let next = 0;
 function event(kind: LedgerEvent["kind"], fields: Partial<LedgerEvent> = {}): LedgerEvent {
@@ -106,4 +106,41 @@ test("replay shows the session as it stood at each step", () => {
   assert.match(replayAt(events, 0), /step 1 of 6/);
   assert.match(replayAt(events, 99), /step 6 of 6/);
   assert.match(replayAt([], 1), /no events/);
+});
+
+test("model calls join the timeline, with what the model chose", () => {
+  next = 0;
+  const asked = { model: "reporter-1", messages: [{ role: "user", content: "hi" }], tools: [{ function: { name: "files__write_file" } }] };
+  const chose = { role: "assistant", tool_calls: [{ function: { name: "files__write_file" } }] };
+  const events = [
+    event("model_request", { tool: "reporter-1", payload: { request: asked } }),
+    event("model_response", {
+      request_seq: 1,
+      tool: "reporter-1",
+      outcome: "ok",
+      payload: { status: 200, body: { json: { choices: [{ message: chose }], usage: { total_tokens: 9 } } } },
+    }),
+    event("call_request", { payload: { effect: { class: "at_most_once" } } }),
+    event("model_request", { tool: "reporter-1", payload: { request: asked } }),
+    event("model_response", { request_seq: 4, tool: "reporter-1", outcome: "timeout", payload: { error: "slow" } }),
+  ];
+  const grouped = calls(events);
+  assert.deepEqual(
+    grouped.map((c) => [c.seq, c.kind]),
+    [
+      [1, "model"],
+      [3, "tool"],
+      [4, "model"],
+    ],
+  );
+  assert.equal(label(grouped[0]), "#1 model reporter-1");
+  assert.equal(description(grouped[0]), "ok, calls files__write_file  [model]");
+  assert.equal(description(grouped[2]), "open (timeout)  [model]");
+  const view = inspect(grouped[0]) as any;
+  assert.equal(view.model, "reporter-1");
+  assert.deepEqual(view.answer, chose);
+  assert.deepEqual(view.tools_offered, ["files__write_file"]);
+  assert.equal(view.usage.total_tokens, 9);
+  assert.match(replayAt(events, 2), /model's answer to call #1: ok/);
+  assert.match(replayAt(events, 2), /#1 model reporter-1\s+ok, calls files__write_file/);
 });

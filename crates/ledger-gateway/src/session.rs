@@ -75,7 +75,7 @@ pub fn resolve_step(parts: &Parts, meta: &serde_json::Value) -> Result<Option<St
     }
 }
 
-fn validate(id: &str) -> Result<(), ErrorData> {
+pub(crate) fn validate(id: &str) -> Result<(), ErrorData> {
     let valid = !id.is_empty()
         && id.len() <= MAX_SESSION_ID_LEN
         && id

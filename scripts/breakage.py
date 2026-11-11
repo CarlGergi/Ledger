@@ -3,7 +3,11 @@
 to protect it notices. A guarantee whose test still passes is not really tested.
 
 Works on a throwaway copy of the source, so an interrupted run cannot leave a fault
-behind. Usage: breakage.py [--list] [name-filter]
+behind. Usage: breakage.py [--list | --check] [name-filter]
+
+--check only confirms that every fault still applies: each edit's text appears exactly
+once in its file. Text that appears twice would break more than the fault says, and text
+that has gone would leave the fault testing nothing. It takes a second, so lint runs it.
 """
 
 import os
@@ -24,6 +28,8 @@ POLICY = "crates/ledger-gateway/src/policy.rs"
 MIGRATION = "crates/ledger-store/migrations/0001_event_log.sql"
 LEASES = "crates/ledger-store/migrations/0002_leases.sql"
 RETRIES = "crates/ledger-store/migrations/0003_retries.sql"
+MODEL_CALLS = "crates/ledger-store/migrations/0004_model_calls.sql"
+MODEL = "crates/ledger-gateway/src/model.rs"
 EVENT = "crates/ledger-store/src/event.rs"
 MEMORY = "crates/ledger-store/src/memory.rs"
 SIM_TEST = "the_first_seeds_keep_every_invariant"
@@ -82,8 +88,8 @@ FAULTS = [
         GATEWAY,
         [
             (
-                "        if let Err(e) = self.append(response).await {\n",
-                "        if let Err(e) = Ok::<(), StoreError>(drop(response)) {\n",
+                "        if let Err(e) = self.append(response).await {\n            tracing::error!(session, tool, seq,",
+                "        if let Err(e) = Ok::<(), StoreError>(drop(response)) {\n            tracing::error!(session, tool, seq,",
             )
         ],
     ),
@@ -262,9 +268,11 @@ FAULTS = [
         POLICY,
         [
             (
-                """                class: EffectClass::AtMostOnce,
+                """            None => Effect {
+                class: EffectClass::AtMostOnce,
                 source: EffectSource::Unlisted,""",
-                """                class: EffectClass::ReadOnly,
+                """            None => Effect {
+                class: EffectClass::ReadOnly,
                 source: EffectSource::Unlisted,""",
             )
         ],
@@ -534,6 +542,72 @@ FAULTS = [
         POLICY,
         [("if let Some(entry) = self.overrides.get(name) {", "if let Some(entry) = self.overrides.get(name).filter(|_| name.is_empty()) {")],
     ),
+    Fault(
+        "model: the model is asked before the request is logged",
+        "a_model_call_that_cannot_be_logged_is_not_sent",
+        GATEWAY,
+        [("        let seq = match self.append(request).await {\n            Ok(event) => event.seq,", "        let _early = upstream.send(&call.body, &call.credentials).await;\n        let seq = match self.append(request).await {\n            Ok(event) => event.seq,")],
+    ),
+    Fault(
+        "model: a reply reaches the agent though it was not logged",
+        "a_reply_that_cannot_be_logged_does_not_reach_the_agent",
+        GATEWAY,
+        [("            tracing::error!(session, model = name, seq, error = %e, \"could not record model reply\");\n            return Err(", "            tracing::error!(session, model = name, seq, error = %e, \"could not record model reply\");\n            return Ok(logged);\n            #[allow(unreachable_code)]\n            return Err(")],
+    ),
+    Fault(
+        "model: the agent's key is logged",
+        "credentials_reach_the_model_but_never_the_log",
+        GATEWAY,
+        [("        let payload = json!({ \"request\": call.body });", "        let payload = json!({ \"request\": call.body, \"auth\": format!(\"{:?}\", call.credentials) });")],
+    ),
+    Fault(
+        "model: every header the agent sent is passed on",
+        "credentials_reach_the_model_but_never_the_log",
+        MODEL,
+        [("pub(crate) fn credentials(headers: &HeaderMap) -> HeaderMap {\n", "pub(crate) fn credentials(headers: &HeaderMap) -> HeaderMap {\n    #[allow(clippy::needless_return)]\n    return headers.clone();\n    #[allow(unreachable_code)]\n")],
+    ),
+    Fault(
+        "model: a stream is logged without its last event",
+        "a_streamed_reply_is_logged_event_by_event_and_delivered_whole",
+        MODEL,
+        [("        if !data.is_empty() {\n            events.push(data.join(\"\\n\"));", "        if !data.is_empty() && data[0] != \"[DONE]\" {\n            events.push(data.join(\"\\n\"));")],
+    ),
+    Fault(
+        "model: any Host is accepted",
+        "a_disallowed_host_or_origin_is_refused_before_anything_is_logged",
+        MODEL,
+        [("    if !matches(host.host(), host.port_u16()) {\n        return false;", "    if !matches(host.host(), host.port_u16()) {\n        return true;")],
+    ),
+    Fault(
+        "model: a takeover flags open model calls",
+        "a_takeover_leaves_an_open_model_call_alone",
+        GATEWAY,
+        [("            e.kind == EventKind::CallRequest\n                && dedup::final_answer(&events, e.seq).is_none()", "            e.kind.is_request()\n                && dedup::final_answer(&events, e.seq).is_none()")],
+    ),
+    Fault(
+        "model: a failed model call is logged as a success",
+        "a_model_error_is_logged_and_passed_on",
+        GATEWAY,
+        [("                } else {\n                    Outcome::RpcError\n                };", "                } else {\n                    Outcome::Ok\n                };")],
+    ),
+    Fault(
+        "model: a timeout counts as the model's final answer",
+        "model_calls_share_the_session_sequence_and_get_one_final_answer",
+        MODEL_CALLS,
+        [("    WHERE kind = 'model_response' AND outcome NOT IN ('transport_error', 'timeout');", "    WHERE kind = 'model_response';")],
+    ),
+    Fault(
+        "model: the schema lets a model request go unhashed",
+        "the_schema_refuses_malformed_model_calls",
+        MODEL_CALLS,
+        [("        CHECK ((kind IN ('call_request', 'model_request')) = (args_hash IS NOT NULL)) NOT VALID;", "        CHECK ((kind = 'call_request') = (args_hash IS NOT NULL) OR kind = 'model_request') NOT VALID;")],
+    ),
+    Fault(
+        "conformance: the memory store lets a model request go unhashed",
+        "the_schema_refuses_malformed_model_calls",
+        MEMORY,
+        [("event.kind.is_request() != event.args_hash.is_some()", "(event.kind == EventKind::CallRequest && event.args_hash.is_none())")],
+    ),
 ]
 
 
@@ -612,8 +686,26 @@ def copy_source(copy: Path) -> None:
             shutil.copy2(source, copy / name)
 
 
+def stale_edits() -> list[str]:
+    """Faults whose edit text is missing from, or appears more than once in, its file."""
+    problems = []
+    for fault in FAULTS:
+        text = (ROOT / fault.path).read_text()
+        for old, _ in fault.edits:
+            count = text.count(old)
+            if count != 1:
+                problems.append(f"{fault.name}: edit text found {count} times in {fault.path}")
+    return problems
+
+
 def main() -> int:
     args = sys.argv[1:]
+    if "--check" in args:
+        problems = stale_edits()
+        for problem in problems:
+            print(problem)
+        print(f"{len(FAULTS)} faults, {len(problems)} that no longer apply cleanly")
+        return 1 if problems else 0
     if "--list" in args:
         for fault in FAULTS:
             print(f"{fault.name}\n    caught by {fault.caught_by}")

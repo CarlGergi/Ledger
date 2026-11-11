@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use ledger_gateway::{Config, Gateway, McpUpstream, Upstream};
+use ledger_gateway::{Config, Gateway, McpUpstream, ModelUpstream, Upstream};
 use ledger_store::{Event, EventKind, EventStore, PgEventStore};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -130,8 +130,16 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 as Arc<dyn Upstream>
         })
         .collect();
-    let gateway = Gateway::with_policy(Arc::new(store), upstreams, config.call_timeout(), policy)
-        .with_lease_ttl(config.lease_ttl());
+    let mut gateway =
+        Gateway::with_policy(Arc::new(store), upstreams, config.call_timeout(), policy)
+            .with_lease_ttl(config.lease_ttl());
+    if let Some(model) = &config.model {
+        gateway = gateway.with_model(ModelUpstream::new(
+            &model.url,
+            model.api_key()?,
+            model.timeout(),
+        ));
+    }
 
     let shutdown = CancellationToken::new();
     tokio::spawn({
@@ -145,17 +153,25 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
-    tracing::info!("gateway on http://{}/mcp", listener.local_addr()?);
+    let address = listener.local_addr()?;
+    tracing::info!("gateway on http://{address}/mcp");
+    if config.model.is_some() {
+        tracing::info!("model proxy on http://{address}/v1/chat/completions");
+    }
     ledger_gateway::serve(gateway, listener, config.allowed_hosts, shutdown).await?;
     Ok(())
 }
 
 fn summary(event: &Event) -> String {
     let what = match (event.kind, event.request_seq, event.outcome) {
+        (EventKind::ModelResponse, Some(request), Some(outcome)) => {
+            format!("model reply to #{request} ({})", outcome.as_str())
+        }
         (_, Some(request), Some(outcome)) => {
             format!("response to #{request} ({})", outcome.as_str())
         }
         (EventKind::CallRetry, Some(request), None) => format!("retry of #{request}"),
+        (EventKind::ModelRequest, _, _) => "model request".to_owned(),
         _ => match event.payload["effect"]["class"].as_str() {
             Some(class) => format!("request ({class})"),
             None => "request".to_owned(),

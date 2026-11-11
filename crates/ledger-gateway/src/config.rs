@@ -33,6 +33,39 @@ pub struct Config {
     pub effect_overrides: Option<PathBuf>,
     #[serde(rename = "upstream", default)]
     pub upstreams: Vec<UpstreamConfig>,
+    /// An OpenAI-compatible model to proxy, logging each call in the agent's session.
+    pub model: Option<ModelConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    /// The base URL an OpenAI client would use, up to and including `/v1`.
+    pub url: String,
+    /// An environment variable holding the key to send. Without one, the agent's own
+    /// `Authorization` or `api-key` header is passed on. Keys are never logged.
+    pub api_key_env: Option<String>,
+    /// How long a model call may take, streamed replies included.
+    #[serde(default = "default_model_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl ModelConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+
+    /// The key named by `api_key_env`, which must then be set.
+    pub fn api_key(&self) -> anyhow::Result<Option<String>> {
+        self.api_key_env
+            .as_deref()
+            .map(|name| std::env::var(name).with_context(|| format!("{name} is not set")))
+            .transpose()
+    }
+}
+
+fn default_model_timeout_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -113,6 +146,16 @@ impl Config {
             !self.upstreams.is_empty(),
             "at least one [[upstream]] is required"
         );
+        if let Some(model) = &self.model {
+            ensure!(
+                model.timeout_secs > 0,
+                "model timeout_secs must be positive"
+            );
+            ensure!(
+                model.url.starts_with("http://") || model.url.starts_with("https://"),
+                "model url must start with http:// or https://"
+            );
+        }
         let mut names = HashSet::new();
         for upstream in &self.upstreams {
             let name = upstream.name.as_str();
@@ -153,6 +196,25 @@ mod tests {
         assert!(config.allowed_hosts.is_empty());
         assert_eq!(config.effect_overrides, None);
         assert_eq!(config.upstreams[0].name, "email");
+        assert_eq!(config.model, None);
+    }
+
+    #[test]
+    fn a_model_can_be_configured() {
+        let text = format!("{UPSTREAMS}\n[model]\nurl = \"https://api.openai.com/v1\"\n");
+        let model = Config::parse(&text).unwrap().model.unwrap();
+        assert_eq!(model.url, "https://api.openai.com/v1");
+        assert_eq!(model.timeout(), Duration::from_secs(300));
+        assert_eq!(model.api_key().unwrap(), None);
+
+        let named = format!(
+            "{UPSTREAMS}\n[model]\nurl = \"http://m/v1\"\napi_key_env = \"LEDGER_TEST_UNSET_KEY\"\ntimeout_secs = 9\n"
+        );
+        let model = Config::parse(&named).unwrap().model.unwrap();
+        assert_eq!(model.timeout(), Duration::from_secs(9));
+        // A key the config names must be there, rather than calls failing later.
+        let error = format!("{:#}", model.api_key().unwrap_err());
+        assert!(error.contains("LEDGER_TEST_UNSET_KEY"), "{error}");
     }
 
     #[test]
@@ -184,6 +246,7 @@ mod tests {
         let zero_timeout = format!("call_timeout_secs = 0\n{UPSTREAMS}");
         let zero_connect = format!("connect_timeout_secs = 0\n{UPSTREAMS}");
         let unknown_field = format!("listn = \"oops\"\n{UPSTREAMS}");
+        let model = |body: &str| format!("{UPSTREAMS}\n[model]\n{body}\n");
         for text in [
             String::new(),
             twice,
@@ -194,6 +257,10 @@ mod tests {
             upstream("a__b"),
             upstream("trailing_"),
             upstream("has space"),
+            model(""),
+            model("url = \"api.openai.com/v1\""),
+            model("url = \"http://m/v1\"\ntimeout_secs = 0"),
+            model("url = \"http://m/v1\"\nkey = \"sk-in-the-file\""),
         ] {
             assert!(Config::parse(&text).is_err(), "should refuse: {text}");
         }

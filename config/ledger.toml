@@ -1,4 +1,5 @@
-# Local development configuration; `make demo` starts these two tool servers.
+# Local development configuration; `make demo` starts these two tool servers and the
+# scripted model.
 listen = "127.0.0.1:7100"
 call_timeout_secs = 60
 effect_overrides = "effects.toml"
@@ -10,3 +11,8 @@ url = "http://127.0.0.1:7101/mcp"
 [[upstream]]
 name = "files"
 url = "http://127.0.0.1:7102/mcp"
+
+# Model calls to http://127.0.0.1:7100/v1 are logged and sent here. For a real provider,
+# use its base URL, such as https://api.openai.com/v1, and set api_key_env.
+[model]
+url = "http://127.0.0.1:7103/v1"

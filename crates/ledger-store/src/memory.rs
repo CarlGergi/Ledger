@@ -85,11 +85,13 @@ fn check(event: &NewEvent, session: Option<&Session>, seq: i64) -> Result<(), St
     }
     // events_shape_check
     let shaped = match event.kind {
-        EventKind::CallRequest => event.request_seq.is_none() && event.outcome.is_none(),
+        EventKind::CallRequest | EventKind::ModelRequest => {
+            event.request_seq.is_none() && event.outcome.is_none()
+        }
         EventKind::CallRetry => {
             event.request_seq.is_some_and(|r| r < seq) && event.outcome.is_none()
         }
-        EventKind::CallResponse => {
+        EventKind::CallResponse | EventKind::ModelResponse => {
             event.request_seq.is_some_and(|r| r < seq) && event.outcome.is_some()
         }
     };
@@ -102,7 +104,7 @@ fn check(event: &NewEvent, session: Option<&Session>, seq: i64) -> Result<(), St
             && h.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     });
-    if !hash_ok || (event.kind == EventKind::CallRequest) != event.args_hash.is_some() {
+    if !hash_ok || event.kind.is_request() != event.args_hash.is_some() {
         return Err(rejected("events_requests_carry_an_args_hash"));
     }
     let events = session.map(|s| s.events.as_slice()).unwrap_or_default();
@@ -112,13 +114,11 @@ fn check(event: &NewEvent, session: Option<&Session>, seq: i64) -> Result<(), St
     {
         return Err(rejected("events_session_id_request_seq_fkey"));
     }
-    // events_one_final_response_per_request
+    // events_one_final_response_per_request and events_one_final_model_response_per_request
     let is_final = |outcome: Option<Outcome>| outcome.is_some_and(Outcome::is_final);
-    if event.kind == EventKind::CallResponse && is_final(event.outcome) {
+    if event.kind.is_response() && is_final(event.outcome) {
         let answered = events.iter().any(|e| {
-            e.kind == EventKind::CallResponse
-                && e.request_seq == event.request_seq
-                && is_final(e.outcome)
+            e.kind == event.kind && e.request_seq == event.request_seq && is_final(e.outcome)
         });
         if answered {
             return Err(rejected("events_one_final_response_per_request"));

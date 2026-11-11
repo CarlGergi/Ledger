@@ -31,6 +31,7 @@ db-reset:
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	python3 scripts/breakage.py --check
 
 test: db-up
 	cargo test --workspace
@@ -59,6 +60,11 @@ soak: db-up
 demo: db-up
 	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
 		target/debug/sample-agent --session $$session && target/debug/ledger log $$session'
+
+# The same task, decided by the scripted model reporter-1 through the gateway's model proxy.
+demo-model: db-up
+	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
+		target/debug/sample-agent --session $$session --model reporter-1 >/dev/null && target/debug/ledger log $$session'
 
 stack: db-up
 	scripts/with-stack.sh sh -c 'echo "gateway on http://127.0.0.1:7100/mcp; Ctrl-C to stop"; while :; do sleep 3600; done'

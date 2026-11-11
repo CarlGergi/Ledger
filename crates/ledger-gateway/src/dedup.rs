@@ -80,7 +80,7 @@ fn call_of(event: &Event) -> Option<i64> {
     match event.kind {
         EventKind::CallRequest => Some(event.seq),
         EventKind::CallRetry => event.request_seq,
-        EventKind::CallResponse => None,
+        EventKind::CallResponse | EventKind::ModelRequest | EventKind::ModelResponse => None,
     }
 }
 

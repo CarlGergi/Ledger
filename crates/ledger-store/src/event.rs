@@ -12,14 +12,30 @@ pub enum EventKind {
     /// An agent asking again for a call already logged, which `request_seq` names.
     CallRetry,
     CallResponse,
+    /// A request to a model, as the agent sent it.
+    ModelRequest,
+    /// The model's answer to the request `request_seq` names.
+    ModelResponse,
 }
 
 impl EventKind {
+    /// Whether the event opens a call, and so carries an arguments hash.
+    pub fn is_request(self) -> bool {
+        matches!(self, Self::CallRequest | Self::ModelRequest)
+    }
+
+    /// Whether the event answers a call, and so carries an outcome.
+    pub fn is_response(self) -> bool {
+        matches!(self, Self::CallResponse | Self::ModelResponse)
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CallRequest => "call_request",
             Self::CallRetry => "call_retry",
             Self::CallResponse => "call_response",
+            Self::ModelRequest => "model_request",
+            Self::ModelResponse => "model_response",
         }
     }
 
@@ -28,6 +44,8 @@ impl EventKind {
             "call_request" => Ok(Self::CallRequest),
             "call_retry" => Ok(Self::CallRetry),
             "call_response" => Ok(Self::CallResponse),
+            "model_request" => Ok(Self::ModelRequest),
+            "model_response" => Ok(Self::ModelResponse),
             other => Err(StoreError::Corrupt(format!("unknown event kind {other:?}"))),
         }
     }
@@ -120,6 +138,27 @@ impl NewEvent {
             outcome: None,
             args_hash: Some(args_hash(arguments)),
             payload,
+        }
+    }
+
+    /// A request to a model. `body` is what the agent sent; the hash covers all of it.
+    pub fn model_request(session_id: &str, model: &str, body: &Value, payload: Value) -> Self {
+        Self {
+            kind: EventKind::ModelRequest,
+            ..Self::request(session_id, model, body, payload)
+        }
+    }
+
+    pub fn model_response(
+        session_id: &str,
+        request_seq: i64,
+        model: &str,
+        outcome: Outcome,
+        payload: Value,
+    ) -> Self {
+        Self {
+            kind: EventKind::ModelResponse,
+            ..Self::response(session_id, request_seq, model, outcome, payload)
         }
     }
 

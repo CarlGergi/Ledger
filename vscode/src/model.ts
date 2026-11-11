@@ -1,7 +1,12 @@
 // The log as Ledger records it, and the views of it the extension shows. Nothing here
 // touches VS Code, so all of it can be tested on its own.
 
-export type EventKind = "call_request" | "call_retry" | "call_response";
+export type EventKind =
+  | "call_request"
+  | "call_retry"
+  | "call_response"
+  | "model_request"
+  | "model_response";
 
 export interface LedgerEvent {
   session_id: string;
@@ -22,9 +27,10 @@ export interface SessionSummary {
   created_at: string;
 }
 
-/** One call: its request, every retry of it, and every answer it got. */
+/** One call, to a tool or a model: its request, every retry of it, and every answer it got. */
 export interface Call {
   seq: number;
+  kind: "tool" | "model";
   tool: string;
   request: LedgerEvent;
   retries: LedgerEvent[];
@@ -42,8 +48,9 @@ export function isFinal(outcome: string | null): boolean {
 export function calls(events: LedgerEvent[]): Call[] {
   const bySeq = new Map<number, Call>();
   for (const event of events) {
-    if (event.kind === "call_request") {
-      bySeq.set(event.seq, { seq: event.seq, tool: event.tool, request: event, retries: [], responses: [] });
+    if (event.kind === "call_request" || event.kind === "model_request") {
+      const kind = event.kind === "call_request" ? "tool" : "model";
+      bySeq.set(event.seq, { seq: event.seq, kind, tool: event.tool, request: event, retries: [], responses: [] });
       continue;
     }
     const call = event.request_seq === null ? undefined : bySeq.get(event.request_seq);
@@ -78,10 +85,25 @@ export function status(call: Call): string {
 }
 
 export function label(call: Call): string {
-  return `#${call.seq} ${call.tool}`;
+  return call.kind === "model" ? `#${call.seq} model ${call.tool}` : `#${call.seq} ${call.tool}`;
+}
+
+/** What a model asked for in its reply: the tools it called, or that it answered in words. */
+function modelChoice(answer: LedgerEvent | undefined): string | null {
+  const body = answer?.payload?.body;
+  const message = body?.json?.choices?.[0]?.message;
+  if (message) {
+    const tools = (message.tool_calls ?? []).map((c: any) => c?.function?.name).filter(Boolean);
+    return tools.length > 0 ? `calls ${tools.join(", ")}` : "answers";
+  }
+  return body?.stream ? "streamed" : null;
 }
 
 export function description(call: Call): string {
+  if (call.kind === "model") {
+    const choice = call.responses.length > 0 ? modelChoice(finalAnswer(call)) : null;
+    return `${status(call)}${choice ? `, ${choice}` : ""}  [model]`;
+  }
   const retries = call.retries.length;
   const tail = retries === 0 ? "" : retries === 1 ? ", 1 retry" : `, ${retries} retries`;
   const effect = call.request.payload?.effect?.class;
@@ -90,6 +112,9 @@ export function description(call: Call): string {
 
 /** Everything about one call, arranged for reading. */
 export function inspect(call: Call): object {
+  if (call.kind === "model") {
+    return inspectModel(call);
+  }
   const params = call.request.payload?.params ?? {};
   const answer = finalAnswer(call);
   return {
@@ -119,6 +144,27 @@ export function inspect(call: Call): object {
   };
 }
 
+function inspectModel(call: Call): object {
+  const request = call.request.payload?.request ?? {};
+  const messages: any[] = request.messages ?? [];
+  const answer = finalAnswer(call);
+  const body = answer?.payload?.body;
+  return {
+    call: call.seq,
+    model: call.tool,
+    status: status(call),
+    requested_at: call.request.recorded_at,
+    fence_token: call.request.fence_token,
+    messages: messages.length,
+    last_message: messages[messages.length - 1] ?? null,
+    tools_offered: (request.tools ?? []).map((t: any) => t?.function?.name),
+    attempts: call.responses.map((r) => ({ event: r.seq, at: r.recorded_at, outcome: r.outcome })),
+    http_status: answer?.payload?.status ?? null,
+    answer: body?.json?.choices?.[0]?.message ?? body?.stream ?? body?.text ?? answer?.payload?.error ?? null,
+    usage: body?.json?.usage ?? null,
+  };
+}
+
 export function inspectText(call: Call): string {
   return JSON.stringify(inspect(call), null, 2) + "\n";
 }
@@ -131,6 +177,10 @@ function describeEvent(event: LedgerEvent): string {
       return `retry of call #${event.request_seq}`;
     case "call_response":
       return `answer to call #${event.request_seq}: ${event.outcome}`;
+    case "model_request":
+      return `call #${event.seq} to model ${event.tool}`;
+    case "model_response":
+      return `model's answer to call #${event.request_seq}: ${event.outcome}`;
   }
 }
 

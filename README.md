@@ -2,7 +2,7 @@
 
 A crash-safe gateway and time-travel debugger for AI agents. Ledger sits between an agent and the tools it calls through [MCP](https://modelcontextprotocol.io). The agent connects to Ledger as if it were its tool server and needs no changes. Ledger records every call in PostgreSQL before forwarding it.
 
-**Status:** the gateway and the event log are working. Retry policy, deduplication, and failover between gateway copies are next; see [Roadmap](#roadmap).
+**Status:** the gateway, retries and failover between gateway copies, the simulation, the VS Code extension, and a proxy that logs model calls are working. Forking a session and regression replay against a new model are next; see [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -96,6 +96,7 @@ The gateway reads a TOML file; see [`config/ledger.toml`](config/ledger.toml).
 | `effect_overrides` | none | File correcting what tools claim about their effects, relative to this one |
 | `allowed_hosts` | loopback only | `Host` values to accept |
 | `[[upstream]]` | none | A tool server: `name` and `url` |
+| `[model]` | none | An OpenAI-compatible model to proxy: `url`, `api_key_env`, `timeout_secs` (default `300`); see [Model calls](#model-calls) |
 
 ## Inspecting the log
 
@@ -180,6 +181,37 @@ While a call runs, the copy renews its lease every quarter of `lease_secs`, so a
 
 Fencing protects the log, not the outside world. A copy that logged a request and then paused can still forward it when it wakes. What keeps that safe is the in-doubt rule above: the copy that takes over never runs such a call again unless its class says that is safe.
 
+## Model calls
+
+The gateway can also stand in for an OpenAI-compatible model, so one log holds what the model was asked, what it answered, and the tool calls that followed, in the order they happened. Point the agent's model client at the gateway instead of the provider:
+
+```text
+http://127.0.0.1:7100/v1                 with the x-ledger-session header
+http://127.0.0.1:7100/s/<session>/v1     for clients that can only set a base URL
+```
+
+The session is the one the agent's tool calls use. `POST /chat/completions` is proxied to `[model] url`. A model call follows the tool-call rule:
+
+1. The request is logged as a `model_request`, with a SHA-256 of the whole body. If that fails, the model is not asked, and the agent gets HTTP 503 with error `-32050`.
+2. The request goes to the model once, with the lease renewed meanwhile.
+3. The reply is logged as a `model_response`. If that fails, the agent gets HTTP 503 with `-32051` instead of the reply.
+4. The agent gets the reply rebuilt from what was logged.
+
+| What happened | What the agent gets | What the log shows |
+| --- | --- | --- |
+| The model answered | The answer | `ok`, with the status and body |
+| The model returned an HTTP error | The same status and body | `rpc_error`, with the status and body |
+| The model could not be reached | HTTP 502, error `-32052` | `transport_error` |
+| The model did not answer within `timeout_secs` | HTTP 504, error `-32052` | `timeout` |
+
+**Streaming.** A streamed reply (`"stream": true`) is read to the end and logged event by event, and only then sent to the agent as the same event stream. The log never holds less than the agent saw, at the cost of the agent receiving the first token only when the last one arrives.
+
+**Credentials.** With `api_key_env` set, the gateway sends that key and ignores the agent's. Without it, the agent's `Authorization` or `api-key` header is passed on. No other header is passed on, and no key is ever logged. Requests whose `Host` or `Origin` is not allowed are refused, by the same rule as `/mcp`, so a web page cannot use the gateway's key through DNS rebinding.
+
+**Model calls have no effects,** so they are never deduplicated, never in doubt, and never flagged when a copy takes a session over. An agent that asks again makes a new model call.
+
+`make demo-model` runs the demo task decided by a scripted model, `reporter-1`, served by `model-server` on port 7103. Its replies depend only on the conversation, which keeps the tests repeatable. `reporter-2` and `reporter-3` differ from it on purpose, for testing replay against a new model.
+
 ## Simulation
 
 `make simulate` runs 10,000 seeds of a deterministic simulation. Each seed sets up three gateway copies sharing one store, a tool server, and two to five agents, all in one thread. Every random choice comes from one generator seeded by the seed, and every timer runs in simulated time. So a seed replays exactly, and a failing one prints the command that replays it with a full trace:
@@ -188,7 +220,7 @@ Fencing protects the log, not the outside world. A copy that logged a request an
 cargo run --release -p ledger-sim -- --seed <n> --trace
 ```
 
-The gateway is the real one, driven through `Gateway::call`. The store is the in-memory store, which `crates/ledger-store/tests/conformance.rs` holds to the PostgreSQL store: one suite runs against both, in CI too, so any difference between them fails a test. The HTTP and MCP transport layer is outside the simulator. The integration tests cover it, against real servers.
+The gateway is the real one, driven through `Gateway::call`. The store is the in-memory store, which `crates/ledger-store/tests/conformance.rs` holds to the PostgreSQL store: one suite runs against both, in CI too, so any difference between them fails a test. The HTTP and MCP transport layer is outside the simulator, and so is the model proxy. The integration tests cover both, against real servers.
 
 **Faults injected,** at rates each seed scales by a factor from 0.5 to 4:
 
@@ -270,8 +302,8 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 | `crates/ledger-gateway` | The gateway and the `ledger` command |
 | `crates/ledger-sim` | The deterministic simulation |
 | `crates/ledger-testkit` | A private, automatically dropped database and reserved ports for each test |
-| `crates/ledger-tools` | Example tool servers: email and files |
-| `crates/sample-agent` | A scripted MCP client |
+| `crates/ledger-tools` | Example tool servers, email and files, and a scripted OpenAI-compatible model |
+| `crates/sample-agent` | MCP clients: a scripted one, and one that a model drives |
 | `vscode` | The VS Code extension |
 | `interop/typescript` | Interoperability check with the official client |
 | `scripts` | The breakage check, the soak, and a helper that runs the full stack |
@@ -284,6 +316,8 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 - **A crashed copy's sessions wait for its leases.** A restarted copy cannot record in them for up to `lease_secs`, because it cannot tell itself apart from a paused original.
 - **No authentication.** Keep the gateway on loopback or behind something that authenticates.
 - **Tools only.** Resources and prompts are not passed through, and neither are progress notifications.
+- **Chat completions only.** The model proxy handles `POST /chat/completions`, not the Responses API, embeddings, or `GET /models`.
+- **Streamed replies arrive all at once,** because each is logged in full before it is sent, so the agent loses streaming's early first token. The alternative keeps both: log each chunk as an event of its own, then forward it, so the agent streams and the log still leads by one chunk. A copy that died mid-stream would leave a reply with no end, which replay would have to treat as cut off. Planned only after milestone 6, if there is time.
 - **The agent's `_meta` is logged but not forwarded,** because it describes the agent's exchange with the gateway.
 - **Clients that only speak MCP 2026-07-28** cannot connect, because they have no handshake to fall back to.
 

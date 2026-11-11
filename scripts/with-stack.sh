@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs a command with the tool servers and the gateway up, then stops them.
+# Runs a command with the tool servers, the scripted model and the gateway up, then stops
+# them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,7 +12,7 @@ listening() {
     (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
 }
 
-for port in 7100 7101 7102; do
+for port in 7100 7101 7102 7103; do
     if listening "$port"; then
         echo "port $port is already in use; is another stack running?" >&2
         exit 1
@@ -28,6 +29,8 @@ trap cleanup EXIT
 target/debug/email-server --outbox var/outbox.jsonl >var/email.log 2>&1 &
 pids+=($!)
 target/debug/file-server --root var/files >var/files.log 2>&1 &
+pids+=($!)
+target/debug/model-server >var/model.log 2>&1 &
 pids+=($!)
 target/debug/ledger serve --config config/ledger.toml >var/ledger.log 2>&1 &
 gateway=$!

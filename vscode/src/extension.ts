@@ -43,6 +43,7 @@ class Log {
 
 function icon(call: Call): vscode.ThemeIcon {
   const current = status(call);
+  if (current === "ok" && call.kind === "model") return new vscode.ThemeIcon("sparkle");
   if (current === "ok") return new vscode.ThemeIcon("pass", new vscode.ThemeColor("testing.iconPassed"));
   if (current === "in_doubt") return new vscode.ThemeIcon("warning", new vscode.ThemeColor("list.warningForeground"));
   if (current.startsWith("open")) return new vscode.ThemeIcon("circle-large-outline");

@@ -68,6 +68,8 @@ conformance!(
     calls_answered_as_in_doubt_are_listed_for_a_person,
     malformed_events_are_refused_and_change_nothing,
     a_refused_append_does_not_extend_the_lease,
+    model_calls_share_the_session_sequence_and_get_one_final_answer,
+    the_schema_refuses_malformed_model_calls,
 );
 
 async fn sequences_start_at_one_and_have_no_gaps(store: Arc<dyn EventStore>) {
@@ -467,4 +469,80 @@ async fn a_refused_append_does_not_extend_the_lease(store: Arc<dyn EventStore>) 
     assert!(store.append(orphan, &renewing).await.is_err());
     // Had the refused append extended the lease, this takeover would fail.
     store.acquire_lease("s", "b", HOUR).await.unwrap();
+}
+
+async fn model_calls_share_the_session_sequence_and_get_one_final_answer(
+    store: Arc<dyn EventStore>,
+) {
+    let lease = store.acquire_lease("s", "a", HOUR).await.unwrap();
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    let tool = store.append(request("s", "t"), &lease).await.unwrap();
+    let asked = store
+        .append(
+            NewEvent::model_request("s", "m", &body, json!({"request": body})),
+            &lease,
+        )
+        .await
+        .unwrap();
+    assert_eq!((tool.seq, asked.seq), (1, 2));
+    assert_eq!(asked.kind, EventKind::ModelRequest);
+    assert_eq!(asked.args_hash.as_deref(), Some(args_hash(&body).as_str()));
+
+    let answer = |outcome| NewEvent::model_response("s", asked.seq, "m", outcome, json!({}));
+    store
+        .append(answer(Outcome::Timeout), &lease)
+        .await
+        .unwrap();
+    store.append(answer(Outcome::Ok), &lease).await.unwrap();
+    assert!(store.append(answer(Outcome::Ok), &lease).await.is_err());
+    // The tool call and the model call are answered separately.
+    store
+        .append(
+            NewEvent::response("s", tool.seq, "t", Outcome::Ok, json!({})),
+            &lease,
+        )
+        .await
+        .unwrap();
+
+    let kinds: Vec<EventKind> = store
+        .session_events("s")
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    use EventKind::*;
+    assert_eq!(
+        kinds,
+        [
+            CallRequest,
+            ModelRequest,
+            ModelResponse,
+            ModelResponse,
+            CallResponse
+        ]
+    );
+}
+
+async fn the_schema_refuses_malformed_model_calls(store: Arc<dyn EventStore>) {
+    let lease = store.acquire_lease("s", "a", HOUR).await.unwrap();
+    let body = json!({"model": "m"});
+    let asked = store
+        .append(NewEvent::model_request("s", "m", &body, json!({})), &lease)
+        .await
+        .unwrap();
+
+    let mut unhashed = NewEvent::model_request("s", "m", &body, json!({}));
+    unhashed.args_hash = None;
+    let mut unanswered = NewEvent::model_response("s", asked.seq, "m", Outcome::Ok, json!({}));
+    unanswered.outcome = None;
+    let mut linked = NewEvent::model_request("s", "m", &body, json!({}));
+    linked.request_seq = Some(asked.seq);
+    let mut hashed = NewEvent::model_response("s", asked.seq, "m", Outcome::Ok, json!({}));
+    hashed.args_hash = Some(args_hash(&body));
+    let dangling = NewEvent::model_response("s", 99, "m", Outcome::Ok, json!({}));
+    for bad in [unhashed, unanswered, linked, hashed, dangling] {
+        assert!(store.append(bad.clone(), &lease).await.is_err(), "{bad:?}");
+    }
+    assert_eq!(store.session_events("s").await.unwrap().len(), 1);
 }

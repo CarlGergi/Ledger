@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::dedup::{self, Decision, Incoming};
+use crate::model::{self, ModelUpstream};
 use crate::policy::{DEFAULT_KEY_PARAM, Effect, EffectClass, EffectPolicy};
 use crate::session::{resolve_session, resolve_step};
 use crate::upstream::{Upstream, UpstreamError};
@@ -52,6 +53,8 @@ pub struct Gateway {
 struct Inner {
     store: Arc<dyn EventStore>,
     upstreams: Vec<Arc<dyn Upstream>>,
+    /// Where model calls go, if this gateway proxies them.
+    model: Option<ModelUpstream>,
     call_timeout: Duration,
     policy: EffectPolicy,
     /// The latest listing of each tool, by the name agents know it by.
@@ -88,6 +91,25 @@ enum Plan {
     Answer(Answer),
 }
 
+/// A model call as it arrived over HTTP.
+pub struct ModelCall {
+    pub session: String,
+    /// The request body, a JSON object.
+    pub body: Value,
+    /// The agent's credentials for the model, used only if the gateway has none.
+    pub credentials: http::HeaderMap,
+}
+
+/// A model call's failure, for the agent: the HTTP status and an OpenAI-style error body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelFailure {
+    pub status: http::StatusCode,
+    pub body: Value,
+}
+
+/// The logged reply on success, which the agent's answer is rebuilt from.
+pub type ModelAnswer = Result<Value, ModelFailure>;
+
 enum Forwarded {
     Answered(Result<CallToolResponse, UpstreamError>),
     TimedOut,
@@ -114,6 +136,7 @@ impl Gateway {
             inner: Arc::new(Inner {
                 store,
                 upstreams,
+                model: None,
                 call_timeout,
                 policy,
                 catalog: Mutex::default(),
@@ -144,6 +167,114 @@ impl Gateway {
         tokio::spawn(async move { gateway.handle(arrival).await.1 })
             .await
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+    }
+
+    /// Proxies model calls to `model`. Call it before serving.
+    pub fn with_model(self, model: ModelUpstream) -> Self {
+        let mut inner = Arc::into_inner(self.inner).expect("configure the gateway before use");
+        inner.model = Some(model);
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Handles a model call, detached from the caller like [`Gateway::call`]: logs the
+    /// request, forwards it once, logs the reply, and returns the reply as logged.
+    pub async fn model_call(&self, call: ModelCall) -> ModelAnswer {
+        let gateway = self.clone();
+        tokio::spawn(async move { gateway.handle_model(call).await })
+            .await
+            .unwrap_or_else(|e| {
+                Err(model_failure(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::INTERNAL_ERROR,
+                    "internal_error",
+                    &e.to_string(),
+                ))
+            })
+    }
+
+    async fn handle_model(&self, call: ModelCall) -> ModelAnswer {
+        let Some(upstream) = &self.inner.model else {
+            return Err(model_failure(
+                http::StatusCode::NOT_FOUND,
+                ErrorCode::METHOD_NOT_FOUND,
+                "not_configured",
+                "this gateway has no [model] configured",
+            ));
+        };
+        let session = call.session.as_str();
+        let name = call.body["model"].as_str().unwrap_or_default().to_owned();
+        let payload = json!({ "request": call.body });
+        let request = NewEvent::model_request(session, &name, &call.body, payload);
+        let seq = match self.append(request).await {
+            Ok(event) => event.seq,
+            Err(e) => {
+                tracing::error!(session, model = name, error = %e, "could not record model call");
+                return Err(model_failure(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    error_codes::NOT_RECORDED,
+                    "not_recorded",
+                    &format!("ledger could not record this call, so it was not sent: {e}"),
+                ));
+            }
+        };
+
+        let heartbeat = self.heartbeat(session).await;
+        let sent = tokio::time::timeout(
+            upstream.timeout(),
+            upstream.send(&call.body, &call.credentials),
+        )
+        .await;
+        drop(heartbeat);
+
+        let (outcome, logged, failure) = match sent {
+            Ok(Ok(reply)) => {
+                let outcome = if reply.status.is_success() {
+                    Outcome::Ok
+                } else {
+                    Outcome::RpcError
+                };
+                (outcome, model::logged(&reply), None)
+            }
+            Ok(Err(e)) => {
+                let message = format!("the model could not be reached: {e}");
+                let failure = (http::StatusCode::BAD_GATEWAY, "transport_error", message);
+                (
+                    Outcome::TransportError,
+                    json!({ "error": failure.2 }),
+                    Some(failure),
+                )
+            }
+            Err(_) => {
+                let message = format!("no answer from the model within {:?}", upstream.timeout());
+                let failure = (http::StatusCode::GATEWAY_TIMEOUT, "timeout", message);
+                (
+                    Outcome::Timeout,
+                    json!({ "error": failure.2 }),
+                    Some(failure),
+                )
+            }
+        };
+        let response = NewEvent::model_response(session, seq, &name, outcome, logged.clone());
+        if let Err(e) = self.append(response).await {
+            tracing::error!(session, model = name, seq, error = %e, "could not record model reply");
+            return Err(model_failure(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::OUTCOME_NOT_RECORDED,
+                "outcome_not_recorded",
+                "the model answered, but ledger could not record the answer",
+            ));
+        }
+        match failure {
+            None => Ok(logged),
+            Some((status, kind, message)) => Err(model_failure(
+                status,
+                error_codes::OUTCOME_UNKNOWN,
+                kind,
+                &message,
+            )),
+        }
     }
 
     /// Sets how long a session stays with this copy after its last append. Another copy
@@ -580,6 +711,18 @@ impl Drop for AbortOnDrop {
 
 /// The idempotency key for a call: the same for every attempt at it, and different for
 /// every other call.
+fn model_failure(
+    status: http::StatusCode,
+    code: ErrorCode,
+    kind: &str,
+    message: &str,
+) -> ModelFailure {
+    ModelFailure {
+        status,
+        body: model::error_body(code.0, kind, message),
+    }
+}
+
 fn key_for(session: &str, seq: i64) -> String {
     format!("ledger:{session}:{seq}")
 }
