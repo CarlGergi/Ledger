@@ -9,6 +9,8 @@ use crate::StoreError;
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     CallRequest,
+    /// An agent asking again for a call already logged, which `request_seq` names.
+    CallRetry,
     CallResponse,
 }
 
@@ -16,6 +18,7 @@ impl EventKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CallRequest => "call_request",
+            Self::CallRetry => "call_retry",
             Self::CallResponse => "call_response",
         }
     }
@@ -23,6 +26,7 @@ impl EventKind {
     pub(crate) fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "call_request" => Ok(Self::CallRequest),
+            "call_retry" => Ok(Self::CallRetry),
             "call_response" => Ok(Self::CallResponse),
             other => Err(StoreError::Corrupt(format!("unknown event kind {other:?}"))),
         }
@@ -45,9 +49,19 @@ pub enum Outcome {
     Timeout,
     /// The gateway had nowhere to send the call, so it was never forwarded.
     NotRouted,
+    /// The gateway turned the call down before forwarding it.
+    Refused,
+    /// The tool may have run, and running it again is not safe. A person should check.
+    InDoubt,
 }
 
 impl Outcome {
+    /// Whether this answers the call for good. The others say only that no answer came
+    /// back, so a later attempt may still record one.
+    pub fn is_final(self) -> bool {
+        !matches!(self, Self::TransportError | Self::Timeout)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -56,6 +70,8 @@ impl Outcome {
             Self::TransportError => "transport_error",
             Self::Timeout => "timeout",
             Self::NotRouted => "not_routed",
+            Self::Refused => "refused",
+            Self::InDoubt => "in_doubt",
         }
     }
 
@@ -67,6 +83,8 @@ impl Outcome {
             "transport_error" => Ok(Self::TransportError),
             "timeout" => Ok(Self::Timeout),
             "not_routed" => Ok(Self::NotRouted),
+            "refused" => Ok(Self::Refused),
+            "in_doubt" => Ok(Self::InDoubt),
             other => Err(StoreError::Corrupt(format!("unknown outcome {other:?}"))),
         }
     }
@@ -101,6 +119,18 @@ impl NewEvent {
             tool: tool.to_owned(),
             outcome: None,
             args_hash: Some(args_hash(arguments)),
+            payload,
+        }
+    }
+
+    pub fn retry(session_id: &str, request_seq: i64, tool: &str, payload: Value) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            kind: EventKind::CallRetry,
+            request_seq: Some(request_seq),
+            tool: tool.to_owned(),
+            outcome: None,
+            args_hash: None,
             payload,
         }
     }

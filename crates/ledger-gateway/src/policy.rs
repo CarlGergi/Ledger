@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::gateway::TOOL_SEPARATOR;
 
 /// The input a tool declares to show that it takes an idempotency key.
-const DEFAULT_KEY_PARAM: &str = "idempotency_key";
+pub(crate) const DEFAULT_KEY_PARAM: &str = "idempotency_key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -86,6 +86,7 @@ async fn a_copy_that_has_been_taken_over_is_fenced_out() {
     .await
     .unwrap();
 
+    // The same email three times: three calls, as far as anyone can tell.
     old.call_tool(send_email()).await.unwrap();
     new.call_tool(send_email()).await.unwrap();
     let fenced = old.call_tool(send_email()).await.unwrap_err();

@@ -1,6 +1,7 @@
 //! The append-only event log: the record of every call that passes through Ledger.
 
 mod event;
+mod memory;
 mod postgres;
 
 use std::time::Duration;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 pub use event::{Event, EventKind, NewEvent, Outcome, SessionSummary, args_hash};
+pub use memory::MemoryStore;
 pub use postgres::{MIGRATOR, PgEventStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +18,9 @@ pub enum StoreError {
     Database(#[from] sqlx::Error),
     #[error("event store holds an unreadable row: {0}")]
     Corrupt(String),
+    /// The in-memory store refusing what the database's constraints would refuse.
+    #[error("event store rejected the event: {0}")]
+    Rejected(String),
     /// Another owner has taken the session over since this lease was granted.
     #[error("the session has been taken over by another owner")]
     Fenced,
@@ -53,9 +58,16 @@ pub trait EventStore: Send + Sync + 'static {
     /// the session has been taken over since.
     async fn append(&self, event: NewEvent, lease: &Lease) -> Result<Event, StoreError>;
 
+    /// Extends `lease` without appending, for a call still running. `Fenced` if the
+    /// session has been taken over.
+    async fn renew_lease(&self, lease: &Lease) -> Result<(), StoreError>;
+
     /// All events of a session, ordered by sequence.
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError>;
 
     /// All sessions, most recently created first.
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError>;
+
+    /// Every call answered as in doubt, for a person to check, oldest first.
+    async fn in_doubt(&self) -> Result<Vec<Event>, StoreError>;
 }

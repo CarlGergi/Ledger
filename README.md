@@ -107,7 +107,7 @@ make sessions
 make log SESSION=<id>
 ```
 
-`ledger log <id> --json` prints full events, including arguments and results, one per line.
+`ledger log <id> --json` prints full events, including arguments and results, one per line. `ledger in-doubt` lists every call flagged for a person (see below).
 
 ## Effect classes
 
@@ -124,7 +124,33 @@ Annotations are only claims made by the tool server, so a file named by `effect_
 
 The gateway learns annotations from listings, whether an agent asked for them or the gateway needed them for a call. A server that is unreachable or stalled when asked costs the call up to `call_timeout_secs` of extra waiting.
 
-So far the class is only recorded; nothing acts on it yet.
+The class decides what happens when a call may have to run twice; see the next section.
+
+## Retries and calls in doubt
+
+An agent that resends a call is told what happened the first time, rather than having the tool run again. A call counts as a retry only if it identifies the call it repeats, and its arguments match (compared by a SHA-256 of the arguments with object keys sorted):
+
+1. **It names the same step,** in the `x-ledger-step` header or as `ledger/step` in its `_meta`, with the same tool and arguments. The same step with different arguments is refused.
+2. **It has the same JSON-RPC id in the same transport session,** with the same tool and arguments. MCP forbids reusing an id, so a client doing so is resending.
+
+A retry is logged, and then:
+
+- **If the call is still running in this copy,** the retry waits for its answer.
+- **If the call has a final answer,** the retry gets it from the log.
+- **Otherwise the call is in doubt:** it was forwarded, and nobody recorded how it ended, so the tool may or may not have run. Ledger never simply runs it again. Instead it goes by the call's class:
+  - **`read_only` and `idempotent`** calls run again.
+  - **`keyed`** calls run again with the same idempotency key.
+  - **Anything else** is answered with `-32052` and logged as `in_doubt`, flagging it for a person. It will never run again. `ledger in-doubt` lists flagged calls.
+
+A copy that takes a session over treats every call left without a final answer as in doubt. Calls that are not safe to repeat are flagged straight away. Safe and keyed ones stay open for a retry to settle. If the old copy then finishes the call, it cannot log the outcome, so its agent gets `-32051` and the call stays in doubt. A copy whose response fails to log for any other reason leaves the call in doubt in the same way.
+
+### Idempotency keys
+
+A keyed tool declares an `idempotency_key` input, or another input named by `key_param` in the override file. The gateway fills it in with `ledger:<session>:<call>`, the same on every attempt at one call and different for every other call. It replaces any key the agent sent, and hides the input from the tool listing, so a model never chooses one. The key is logged with each response.
+
+The demo's `send_email` takes a key: a repeated key returns the first message and sends nothing. `append_file` takes none, and is at most once.
+
+**The trade-off.** Identical arguments on their own never make a retry, because an agent may well mean to send the same email twice, and both must go. So a retry is recognised only by its step or its request id. An agent that resends with a new id and no step gets the tool run again. Agents that number their steps, or resend with the same id, get exactly one run. The exception is after a takeover: any call left without an answer that is not safe to repeat is flagged as in doubt before anything else happens in the session, whatever the agent sends next.
 
 ## Several gateway copies
 
@@ -132,10 +158,11 @@ Copies of the gateway can share one database. Each session belongs to one copy a
 
 Every append carries its copy's token, and the statement that writes the event also checks it. So a copy that was paused, perhaps for longer than its lease, cannot append once another copy has taken over, however sure it is that it still owns the session. Its calls fail with `-32050` before they reach a tool. Lease expiry uses the database's clock, the one clock every copy shares.
 
-Each request is also logged with a SHA-256 of its arguments, in a canonical form with object keys sorted, ready for recognising retries.
+While a call runs, the copy renews its lease every quarter of `lease_secs`, so a call longer than the lease keeps the session.
 
-Fencing protects the log, not the outside world. A copy that logged a request and then paused can still forward it when it wakes. What keeps that safe is the effect class, once retries act on it.
+Fencing protects the log, not the outside world. A copy that logged a request and then paused can still forward it when it wakes. What keeps that safe is the in-doubt rule above: the copy that takes over never runs such a call again unless its class says that is safe.
 
+## Testing
 
 | Command | What it does |
 | --- | --- |
@@ -177,18 +204,19 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 
 | Path | Contents |
 | --- | --- |
-| `crates/ledger-store` | Event model, the `EventStore` trait, PostgreSQL store, migrations |
+| `crates/ledger-store` | Event model, the `EventStore` trait, PostgreSQL and in-memory stores, migrations, the conformance suite |
 | `crates/ledger-gateway` | The gateway and the `ledger` command |
-| `crates/ledger-testkit` | A private, automatically dropped database for each test |
+| `crates/ledger-testkit` | A private, automatically dropped database and reserved ports for each test |
 | `crates/ledger-tools` | Example tool servers: email and files |
 | `crates/sample-agent` | A scripted MCP client |
 | `interop/typescript` | Interoperability check with the official client |
-| `scripts` | The breakage check and a helper that runs the full stack |
+| `scripts` | The breakage check, the soak, and a helper that runs the full stack |
+| `.github/workflows` | CI: lint and every test, against PostgreSQL |
 
 ## Current limits
 
-- **No retries or deduplication yet.** A call an agent retries runs again.
-- **A call can outlast its lease.** Nothing renews a lease during a tool call, so a call longer than `lease_secs` lets another copy take the session, and the call's outcome then cannot be logged (`-32051`).
+- **Retry detection reads the whole session's log** for each call, which is fine for sessions of thousands of calls, not millions.
+- **An agent that resends with a new request id and no step is not recognised as retrying,** so the tool runs again. See "The trade-off" above.
 - **A crashed copy's sessions wait for its leases.** A restarted copy cannot record in them for up to `lease_secs`, because it cannot tell itself apart from a paused original.
 - **No authentication.** Keep the gateway on loopback or behind something that authenticates.
 - **Tools only.** Resources and prompts are not passed through, and neither are progress notifications.
@@ -198,7 +226,7 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 ## Roadmap
 
 1. ~~Pass-through gateway and event log~~
-2. Effect policy from MCP annotations, deduplication, idempotency keys, leases with fencing tokens
+2. ~~Effect policy from MCP annotations, deduplication, idempotency keys, leases with fencing tokens~~
 3. Deterministic simulation testing with fault injection
 4. VS Code extension: timeline, inspect, replay
 5. Model proxy, forking a session at any step, regression replay against a new model

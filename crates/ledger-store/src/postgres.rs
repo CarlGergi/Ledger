@@ -170,6 +170,33 @@ impl EventStore for PgEventStore {
         })
     }
 
+    async fn renew_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        let renewed = sqlx::query(
+            "UPDATE leases SET expires_at = now() + make_interval(secs => $3)
+             WHERE session_id = $1 AND token = $2",
+        )
+        .bind(&lease.session_id)
+        .bind(lease.token)
+        .bind(lease.ttl.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        if renewed.rows_affected() == 0 {
+            return Err(StoreError::Fenced);
+        }
+        Ok(())
+    }
+
+    async fn in_doubt(&self) -> Result<Vec<Event>, StoreError> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT session_id, seq, kind, request_seq, tool, outcome, args_hash, fence_token,
+                    payload::text AS payload, recorded_at
+             FROM events WHERE outcome = 'in_doubt' ORDER BY recorded_at, session_id, seq",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Event::try_from).collect()
+    }
+
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError> {
         let rows: Vec<EventRow> = sqlx::query_as(
             "SELECT session_id, seq, kind, request_seq, tool, outcome, args_hash, fence_token,

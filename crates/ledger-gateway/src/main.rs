@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ledger_gateway::{Config, Gateway, McpUpstream, Upstream};
-use ledger_store::{Event, EventStore, PgEventStore};
+use ledger_store::{Event, EventKind, EventStore, PgEventStore};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -41,6 +41,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List calls flagged for a person: they may have run, and are not safe to run again.
+    InDoubt {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 #[tokio::main]
@@ -61,6 +66,20 @@ async fn main() -> anyhow::Result<()> {
                     session.created_at.to_rfc3339(),
                     session.event_count,
                     session.session_id
+                );
+            }
+            Ok(())
+        }
+        Command::InDoubt { database_url } => {
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
+            for flag in store.in_doubt().await? {
+                println!(
+                    "{}  {}  call #{}  {}  {}",
+                    flag.recorded_at.to_rfc3339(),
+                    flag.session_id,
+                    flag.request_seq.unwrap_or_default(),
+                    flag.tool,
+                    flag.payload["reason"].as_str().unwrap_or_default()
                 );
             }
             Ok(())
@@ -125,10 +144,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 fn summary(event: &Event) -> String {
-    let what = match (event.request_seq, event.outcome) {
-        (Some(request), Some(outcome)) => {
+    let what = match (event.kind, event.request_seq, event.outcome) {
+        (_, Some(request), Some(outcome)) => {
             format!("response to #{request} ({})", outcome.as_str())
         }
+        (EventKind::CallRetry, Some(request), None) => format!("retry of #{request}"),
         _ => match event.payload["effect"]["class"].as_str() {
             Some(class) => format!("request ({class})"),
             None => "request".to_owned(),

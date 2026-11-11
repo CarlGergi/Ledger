@@ -19,10 +19,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 GATEWAY = "crates/ledger-gateway/src/gateway.rs"
 GATEWAY_MAIN = "crates/ledger-gateway/src/main.rs"
+DEDUP = "crates/ledger-gateway/src/dedup.rs"
 POLICY = "crates/ledger-gateway/src/policy.rs"
 MIGRATION = "crates/ledger-store/migrations/0001_event_log.sql"
 LEASES = "crates/ledger-store/migrations/0002_leases.sql"
+RETRIES = "crates/ledger-store/migrations/0003_retries.sql"
 EVENT = "crates/ledger-store/src/event.rs"
+MEMORY = "crates/ledger-store/src/memory.rs"
 STORE = "crates/ledger-store/src/postgres.rs"
 PORT = "crates/ledger-testkit/src/port.rs"
 UPSTREAM = "crates/ledger-gateway/src/upstream.rs"
@@ -44,14 +47,13 @@ FAULTS = [
         GATEWAY,
         [
             (
-                """        let request = store
-            .append(NewEvent::request(session, &tool, request_payload))""",
-                """        let forwarded = self.forward(params).await;
-        let request = store
-            .append(NewEvent::request(session, &tool, request_payload))""",
+                "        let guard = lock.lock().await;\n",
+                "        let early = self.forward(arrival.params.clone()).await;\n        let guard = lock.lock().await;\n",
             ),
-            ("        let forwarded = self.forward(params).await;\n        let (outcome,",
-             "        let (outcome,"),
+            (
+                "        let forwarded = self.forward(params).await;\n",
+                "        let forwarded = { drop(params); Forwarded::NotRouted };\n",
+            ),
         ],
     ),
     Fault(
@@ -60,15 +62,16 @@ FAULTS = [
         GATEWAY,
         [
             (
-                """                    "the tool may have run, but ledger could not record the outcome",
-                    None,
-                )
-            })?;""",
-                """                    "the tool may have run, but ledger could not record the outcome",
-                    None,
-                )
-            })
-            .ok();""",
+                """            return Err(ErrorData::new(
+                error_codes::OUTCOME_NOT_RECORDED,
+                "the tool may have run, but ledger could not record the outcome",
+                None,
+            ));""",
+                """            let _ = ErrorData::new(
+                error_codes::OUTCOME_NOT_RECORDED,
+                "the tool may have run, but ledger could not record the outcome",
+                None,
+            );""",
             )
         ],
     ),
@@ -78,19 +81,8 @@ FAULTS = [
         GATEWAY,
         [
             (
-                """            .append(NewEvent::response(
-                session,
-                request.seq,
-                &tool,
-                outcome,
-                response_payload,
-            ))
-            .await""",
-                """            .session_events(session)
-            .await
-            .map(|_| {
-                let _ = (&outcome, &response_payload);
-            })""",
+                "        if let Err(e) = self.append(response).await {\n",
+                "        if let Err(e) = Ok::<(), StoreError>(drop(response)) {\n",
             )
         ],
     ),
@@ -100,18 +92,13 @@ FAULTS = [
         GATEWAY,
         [
             (
-                """        tokio::spawn(async move {
-            gateway
-                .record_and_forward(&session, rpc_id, meta, request)
-                .await
-        })
-        .await
-        .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?""",
-                """        let _ = ErrorCode::INTERNAL_ERROR;
-        tokio::select! {
-            r = gateway.record_and_forward(&session, rpc_id, meta, request) => r,
+                "        self.call(arrival).await\n    }\n}",
+                """        tokio::select! {
+            answer = self.handle(arrival) => answer.1,
             _ = context.ct.cancelled() => Err(ErrorData::internal_error("cancelled", None)),
-        }""",
+        }
+    }
+}""",
             )
         ],
     ),
@@ -169,12 +156,7 @@ FAULTS = [
         "the agent's _meta is left out of the log",
         "the_agents_meta_is_logged_but_not_forwarded",
         GATEWAY,
-        [
-            (
-                '"meta": meta, "effect": effect, ',
-                '"effect": effect, ',
-            )
-        ],
+        [('            "meta": arrival.meta,\n', "")],
     ),
     Fault(
         "append-only triggers removed",
@@ -203,18 +185,24 @@ FAULTS = [
         [("SET last_seq = sessions.last_seq + 1", "SET last_seq = sessions.last_seq + 2")],
     ),
     Fault(
-        "a call may be given two responses",
-        "a_call_cannot_have_two_responses",
-        MIGRATION,
+        "a call may be given two final answers",
+        "a_retry_links_to_its_call_and_a_call_gets_one_final_answer",
+        RETRIES,
         [
             (
-                """CREATE UNIQUE INDEX events_one_response_per_request
+                """CREATE UNIQUE INDEX events_one_final_response_per_request
     ON events (session_id, request_seq)
-    WHERE request_seq IS NOT NULL;
+    WHERE kind = 'call_response' AND outcome NOT IN ('transport_error', 'timeout');
 """,
                 "",
             )
         ],
+    ),
+    Fault(
+        "dedup: a timeout counts as a final answer",
+        "a_retry_links_to_its_call_and_a_call_gets_one_final_answer",
+        EVENT,
+        [("!matches!(self, Self::TransportError | Self::Timeout)", "!matches!(self, Self::TransportError)")],
     ),
     Fault(
         "connecting to a tool server has no limit of its own",
@@ -314,7 +302,7 @@ FAULTS = [
         "effect policy decisions are left out of the log",
         "the_real_tools_are_logged_with_the_class_their_annotations_give",
         GATEWAY,
-        [('"effect": effect, ', "")],
+        [('                payload["effect"] = json!(effect);\n', "                let _ = &effect;\n")],
     ),
     Fault(
         "effect policy file errors do not stop startup",
@@ -388,6 +376,106 @@ FAULTS = [
         "a_copy_cannot_record_in_a_session_another_copy_holds",
         STORE,
         [("        WHERE leases.expires_at <= now() OR leases.owner = excluded.owner\n", "")],
+    ),
+    Fault(
+        "dedup: an unsafe call in doubt runs again on a retry",
+        "an_unsafe_call_in_doubt_is_flagged_and_never_runs_again",
+        GATEWAY,
+        [("            EffectClass::ReadOnly | EffectClass::Idempotent => {\n", "            EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::AtMostOnce => {\n")],
+    ),
+    Fault(
+        "dedup: taking a session over leaves open calls unflagged",
+        "a_takeover_flags_an_open_unsafe_call_and_its_late_outcome_is_not_logged",
+        GATEWAY,
+        [("        self.flag_open_calls(&lease).await?;\n", "")],
+    ),
+    Fault(
+        "dedup: a call whose outcome was not logged stays in flight",
+        "an_unsafe_call_in_doubt_is_flagged_and_never_runs_again",
+        GATEWAY,
+        [
+            (
+                """                    .in_flight
+                    .lock()
+                    .expect("lock poisoned")
+                    .remove(&id);""",
+                """                    .in_flight
+                    .lock()
+                    .expect("lock poisoned")
+                    .get(&id);""",
+            )
+        ],
+    ),
+    Fault(
+        "dedup: a keyed retry gets a new key",
+        "a_keyed_call_whose_outcome_was_lost_runs_again_with_the_same_key",
+        GATEWAY,
+        [("let key = Some((param, key_for(session, request.seq)));", "let key = Some((param, key_for(session, request.seq + 1)));")],
+    ),
+    Fault(
+        "dedup: no heartbeat during a call",
+        "a_call_longer_than_the_lease_keeps_the_session",
+        GATEWAY,
+        [("        if ttl.is_zero() {\n", "        if ttl.is_zero() || ttl > Duration::ZERO {\n")],
+    ),
+    Fault(
+        "dedup: identical arguments alone make a retry",
+        "identical_calls_without_a_step_all_run",
+        DEDUP,
+        [("&& &e.payload[\"rpc_id\"] == call.rpc_id", "|| true")],
+    ),
+    Fault(
+        "dedup: a step reused for other arguments is accepted",
+        "a_step_reused_for_other_arguments_is_refused",
+        DEDUP,
+        [("            return if matches(seq) {\n", "            return if matches(seq) || true {\n")],
+    ),
+    Fault(
+        "dedup: the same id in the same transport session is not a retry",
+        "the_same_id_in_the_same_transport_session_is_a_retry",
+        DEDUP,
+        [("            return Decision::Retry(seq);\n        }\n    }\n", "            let _ = seq;\n        }\n    }\n")],
+    ),
+    Fault(
+        "dedup: agents see the idempotency key",
+        "tools_pass_through_with_their_annotations_and_schemas",
+        GATEWAY,
+        [("        if let Some(param) = effect.key_param {\n", "        if let Some(param) = effect.key_param.filter(|_| false) {\n")],
+    ),
+    Fault(
+        "dedup: an agent's own key is kept",
+        "an_agents_own_key_is_replaced",
+        GATEWAY,
+        [(".insert(param.clone(), Value::String(key.clone()));", ".entry(param.clone()).or_insert(Value::String(key.clone()));")],
+    ),
+    Fault(
+        "conformance: the memory store ignores fencing",
+        "an_append_with_a_stale_token_is_rejected",
+        MEMORY,
+        [("            Some(row) if row.token == lease.token => {}\n            _ => return Err(StoreError::Fenced),", "            Some(_) => {}\n            _ => return Err(StoreError::Fenced),")],
+    ),
+    Fault(
+        "conformance: the memory store accepts a second final answer",
+        "a_retry_links_to_its_call_and_a_call_gets_one_final_answer",
+        MEMORY,
+        [("        if answered {\n", "        if answered && false {\n")],
+    ),
+    Fault(
+        "conformance: the memory store renews on a refused append",
+        "a_refused_append_does_not_extend_the_lease",
+        MEMORY,
+        [
+            (
+                "        check(&event, session, seq)?;\n",
+                """        if let Err(refused) = check(&event, session, seq) {
+            if let Some(row) = state.leases.get_mut(&event.session_id) {
+                row.expires_at = expiry(now, lease.ttl);
+            }
+            return Err(refused);
+        }
+""",
+            )
+        ],
     ),
 ]
 

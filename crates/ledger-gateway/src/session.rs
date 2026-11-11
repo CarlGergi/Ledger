@@ -11,6 +11,12 @@ const TRANSPORT_SESSION_HEADER: &str = "mcp-session-id";
 
 const MAX_SESSION_ID_LEN: usize = 128;
 
+/// Numbers a call within its session, so that resending it is recognised as a retry.
+pub const STEP_HEADER: &str = "x-ledger-step";
+/// The same as [`STEP_HEADER`], in a call's `_meta`, for clients that set it per call.
+pub const STEP_META_KEY: &str = "ledger/step";
+const MAX_STEP_LEN: usize = 128;
+
 /// An explicit id wins. Without one, the MCP transport session stands in, so an agent
 /// that knows nothing about Ledger still gets one log per connection.
 pub fn resolve_session(parts: &Parts) -> Result<String, ErrorData> {
@@ -41,6 +47,32 @@ pub fn resolve_session(parts: &Parts) -> Result<String, ErrorData> {
         })?;
     validate(id)?;
     Ok(id.to_owned())
+}
+
+/// The step an agent gave a call, if any: a string or a whole number, from the header or
+/// from `_meta`, with the header winning.
+pub fn resolve_step(parts: &Parts, meta: &serde_json::Value) -> Result<Option<String>, ErrorData> {
+    let invalid = || {
+        ErrorData::invalid_request(
+            format!(
+                "invalid step: use a string of 1 to {MAX_STEP_LEN} characters or a whole number"
+            ),
+            None,
+        )
+    };
+    let step = match parts.headers.get(STEP_HEADER) {
+        Some(value) => Some(value.to_str().map_err(|_| invalid())?.to_owned()),
+        None => match &meta[STEP_META_KEY] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(step) => Some(step.clone()),
+            serde_json::Value::Number(n) if n.is_u64() || n.is_i64() => Some(n.to_string()),
+            _ => return Err(invalid()),
+        },
+    };
+    match step {
+        Some(step) if step.is_empty() || step.len() > MAX_STEP_LEN => Err(invalid()),
+        step => Ok(step),
+    }
 }
 
 fn validate(id: &str) -> Result<(), ErrorData> {
@@ -119,6 +151,29 @@ mod tests {
 
         let not_ascii = parts("/mcp", &[(SESSION_HEADER, b"caf\xc3\xa9")]);
         assert!(resolve_session(&not_ascii).is_err());
+    }
+
+    #[test]
+    fn a_step_comes_from_the_header_or_from_meta() {
+        let none = parts("/mcp", &[]);
+        assert_eq!(resolve_step(&none, &serde_json::json!({})).unwrap(), None);
+        let meta = serde_json::json!({ STEP_META_KEY: 7 });
+        assert_eq!(resolve_step(&none, &meta).unwrap().as_deref(), Some("7"));
+        let meta = serde_json::json!({ STEP_META_KEY: "seven" });
+        assert_eq!(
+            resolve_step(&none, &meta).unwrap().as_deref(),
+            Some("seven")
+        );
+        let header = parts("/mcp", &[(STEP_HEADER, b"h")]);
+        assert_eq!(resolve_step(&header, &meta).unwrap().as_deref(), Some("h"));
+        for bad in [
+            serde_json::json!(1.5),
+            serde_json::json!(""),
+            serde_json::json!([1]),
+        ] {
+            let meta = serde_json::json!({ STEP_META_KEY: bad });
+            assert!(resolve_step(&none, &meta).is_err(), "{meta}");
+        }
     }
 
     #[test]

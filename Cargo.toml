@@ -15,6 +15,7 @@ rust-version = "1.99"
 publish = false
 
 [workspace.dependencies]
+ledger-gateway = { path = "crates/ledger-gateway" }
 ledger-store = { path = "crates/ledger-store" }
 ledger-testkit = { path = "crates/ledger-testkit" }
 ledger-tools = { path = "crates/ledger-tools" }

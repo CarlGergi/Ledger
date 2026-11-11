@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+          POSTGRES_DB: ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger"
+          --health-interval 2s
+          --health-timeout 10s
+          --health-retries 30
+    env:
+      # Every test, including the store conformance suite, runs against this server.
+      DATABASE_URL: postgres://ledger:ledger@127.0.0.1:5432/ledger
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99 --profile minimal --component rustfmt,clippy
+          rustup default 1.99
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Lint
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked

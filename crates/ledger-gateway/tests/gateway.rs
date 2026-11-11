@@ -141,7 +141,8 @@ fn rpc_error(error: ServiceError) -> rmcp::ErrorData {
     }
 }
 
-/// Requests and responses must pair up 1:1, each response after its own request.
+/// Every request is answered, after it, with at most one final answer. Retries and
+/// answers that say nothing came back link to an earlier request.
 fn assert_well_formed(events: &[Event]) {
     let seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
     let expected: Vec<i64> = (1..=events.len() as i64).collect();
@@ -153,17 +154,28 @@ fn assert_well_formed(events: &[Event]) {
         .map(|e| (e.seq, e))
         .collect();
     let mut answered = HashSet::new();
-    for response in events.iter().filter(|e| e.kind == EventKind::CallResponse) {
-        let request_seq = response.request_seq.expect("responses link to a request");
+    let mut finally_answered = HashSet::new();
+    let links = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::CallResponse | EventKind::CallRetry));
+    for event in links {
+        let request_seq = event
+            .request_seq
+            .expect("responses and retries link to a call");
         let request = requests
             .get(&request_seq)
             .expect("link points at a request");
-        assert!(request.seq < response.seq, "response before its request");
-        assert_eq!(request.tool, response.tool);
-        assert!(
-            answered.insert(request_seq),
-            "two responses for one request"
-        );
+        assert!(request.seq < event.seq, "linked before its request");
+        assert_eq!(request.tool, event.tool);
+        if event.kind == EventKind::CallResponse {
+            answered.insert(request_seq);
+            if event.outcome.unwrap().is_final() {
+                assert!(
+                    finally_answered.insert(request_seq),
+                    "two final responses for one request"
+                );
+            }
+        }
     }
     assert_eq!(answered.len(), requests.len(), "a request has no response");
 }
@@ -241,6 +253,16 @@ async fn tools_pass_through_with_their_annotations_and_schemas() {
             expected.push(tool);
         }
     }
+    // The one difference: a keyed tool's key is the gateway's to fill in, so agents do
+    // not see it.
+    let send = expected
+        .iter_mut()
+        .find(|t| t.name == "email__send_email")
+        .unwrap();
+    let mut schema = (*send.input_schema).clone();
+    let properties = schema["properties"].as_object_mut().unwrap();
+    assert!(properties.remove("idempotency_key").is_some());
+    send.input_schema = Arc::new(schema);
     let actual = through_gateway.list_all_tools().await.unwrap();
     assert_eq!(actual, expected);
 
@@ -399,15 +421,30 @@ async fn a_dead_tool_server_is_logged_and_recovered_from() {
     let error = rpc_error(agent.call_tool(send_email()).await.unwrap_err());
     assert_eq!(error.code, error_codes::OUTCOME_UNKNOWN);
 
+    // Sent again with a new id and no step: a new call, not a retry.
     email.start_again().await;
     agent.call_tool(send_email()).await.unwrap();
 
     let events = store.session_events("s").await.unwrap();
     assert_well_formed(&events);
-    let outcomes: Vec<_> = events.iter().filter_map(|e| e.outcome).collect();
+    let shape: Vec<_> = events
+        .iter()
+        .map(|e| (e.kind, e.request_seq, e.outcome))
+        .collect();
     assert_eq!(
-        outcomes,
-        [Outcome::Ok, Outcome::TransportError, Outcome::Ok]
+        shape,
+        [
+            (EventKind::CallRequest, None, None),
+            (EventKind::CallResponse, Some(1), Some(Outcome::Ok)),
+            (EventKind::CallRequest, None, None),
+            (
+                EventKind::CallResponse,
+                Some(3),
+                Some(Outcome::TransportError)
+            ),
+            (EventKind::CallRequest, None, None),
+            (EventKind::CallResponse, Some(5), Some(Outcome::Ok)),
+        ]
     );
     assert_eq!(email.outbox.sent().await.unwrap().len(), 2);
 }

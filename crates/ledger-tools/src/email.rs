@@ -23,6 +23,9 @@ pub struct SentEmail {
     pub subject: String,
     pub body: String,
     pub sent_at: DateTime<Utc>,
+    /// The key it was sent with, if any. Sending again with the same key sends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// The append-only file that stands in for a mail provider.
@@ -41,9 +44,31 @@ impl Outbox {
     }
 
     pub async fn deliver(&self, email: &SentEmail) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        self.append(email).await
+    }
+
+    /// Delivers `email` unless a message with the same key was delivered already, in which
+    /// case that message is returned and nothing is sent. Without a key, always delivers.
+    pub async fn deliver_once(&self, email: SentEmail) -> io::Result<SentEmail> {
+        let _guard = self.write_lock.lock().await;
+        if let Some(key) = &email.idempotency_key {
+            let earlier = self
+                .sent()
+                .await?
+                .into_iter()
+                .find(|sent| sent.idempotency_key.as_ref() == Some(key));
+            if let Some(earlier) = earlier {
+                return Ok(earlier);
+            }
+        }
+        self.append(&email).await?;
+        Ok(email)
+    }
+
+    async fn append(&self, email: &SentEmail) -> io::Result<()> {
         let mut line = serde_json::to_vec(email)?;
         line.push(b'\n');
-        let _guard = self.write_lock.lock().await;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -74,6 +99,9 @@ pub struct SendEmailRequest {
     pub subject: String,
     /// Plain-text message body.
     pub body: String,
+    /// Sending again with the same key returns the first message and sends nothing.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -112,7 +140,8 @@ fn validate(request: &SendEmailRequest) -> Result<(), String> {
 
 #[tool_router]
 impl EmailServer {
-    /// Send an email. Every successful call delivers one new message.
+    /// Send an email. Every successful call delivers one new message, except a repeat of an
+    /// earlier call's idempotency key, which returns that call's message instead.
     #[tool(annotations(
         title = "Send email",
         read_only_hint = false,
@@ -131,12 +160,14 @@ impl EmailServer {
             subject: request.subject,
             body: request.body,
             sent_at: Utc::now(),
+            idempotency_key: request.idempotency_key,
         };
-        self.outbox
-            .deliver(&email)
+        let sent = self
+            .outbox
+            .deliver_once(email)
             .await
             .map_err(|e| format!("delivery failed: {e}"))?;
-        Ok(Json(email))
+        Ok(Json(sent))
     }
 
     /// List every email sent so far, oldest first.
@@ -173,6 +204,7 @@ mod tests {
             to: to.to_owned(),
             subject: subject.to_owned(),
             body: "hello".to_owned(),
+            idempotency_key: None,
         }
     }
 
@@ -198,6 +230,24 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_ne!(sent[0].message_id, sent[1].message_id);
         assert_eq!(sent[0].to, "a@example.com");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_key_returns_the_first_message_and_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, outbox) = server(&dir);
+        let keyed = |key: &str| SendEmailRequest {
+            idempotency_key: Some(key.to_owned()),
+            ..request("a@example.com", "hi")
+        };
+
+        let first = server.send_email(Parameters(keyed("k1"))).await.unwrap().0;
+        let again = server.send_email(Parameters(keyed("k1"))).await.unwrap().0;
+        let other = server.send_email(Parameters(keyed("k2"))).await.unwrap().0;
+
+        assert_eq!(again, first);
+        assert_ne!(other.message_id, first.message_id);
+        assert_eq!(outbox.sent().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

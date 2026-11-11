@@ -5,6 +5,7 @@ mod common;
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::{Probe, eventually, spawn_tool_server};
@@ -198,7 +199,9 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
     assert_eq!(events[0].kind, EventKind::CallRequest);
     assert_eq!(events[0].tool, "probe__wait");
 
-    // The next copy carries on from there without a gap.
+    // The next copy carries on from there without a gap. Taking the session over, it
+    // finds the interrupted call in doubt and, since it is not safe to repeat, flags it
+    // for a person rather than ever running it again.
     let _ledger = start_ledger(&config, db_url);
     wait_for_listener(addr).await;
     let agent = connect(&url, Some("s")).await.unwrap();
@@ -208,9 +211,28 @@ async fn a_crash_mid_call_leaves_the_request_on_record() {
         .unwrap();
 
     let events = store.session_events("s").await.unwrap();
-    let seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, [1, 2, 3]);
-    assert_eq!(events[2].request_seq, Some(2));
+    let shape: Vec<_> = events
+        .iter()
+        .map(|e| (e.seq, e.kind, e.request_seq, e.outcome))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (1, EventKind::CallRequest, None, None),
+            (2, EventKind::CallResponse, Some(1), Some(Outcome::InDoubt)),
+            (3, EventKind::CallRequest, None, None),
+            (4, EventKind::CallResponse, Some(3), Some(Outcome::Ok)),
+        ]
+    );
+    // The interrupted call and `observe`: the interrupted one never ran again.
+    assert_eq!(probe.started.load(Ordering::SeqCst), 2);
+
+    let (ok, flagged) = ledger_output(&["in-doubt"], db_url);
+    assert!(ok);
+    assert!(
+        flagged.contains("call #1") && flagged.contains("probe__wait"),
+        "{flagged}"
+    );
 }
 
 #[test]

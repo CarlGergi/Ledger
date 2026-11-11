@@ -119,6 +119,10 @@ async fn the_real_tools_are_logged_with_the_class_their_annotations_give() {
             "email__send_email",
             json!({"to": "a@example.com", "subject": "s", "body": "b"}),
         ),
+        (
+            "files__append_file",
+            json!({"path": "log.txt", "content": "x"}),
+        ),
     ] {
         agent.call_tool(call_params(tool, arguments)).await.unwrap();
     }
@@ -128,6 +132,7 @@ async fn the_real_tools_are_logged_with_the_class_their_annotations_give() {
         [
             json!({"class": "idempotent", "source": "listing"}),
             json!({"class": "read_only", "source": "listing"}),
+            json!({"class": "keyed", "source": "listing", "key_param": "idempotency_key"}),
             json!({"class": "at_most_once", "source": "listing"}),
         ]
     );

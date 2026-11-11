@@ -100,6 +100,10 @@ impl FaultyStore {
     pub async fn fail_appends_of(&self, kind: EventKind) {
         *self.fail_kind.lock().await = Some(kind);
     }
+
+    pub async fn heal(&self) {
+        *self.fail_kind.lock().await = None;
+    }
 }
 
 #[async_trait]
@@ -120,8 +124,16 @@ impl EventStore for FaultyStore {
         self.inner.append(event, lease).await
     }
 
+    async fn renew_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        self.inner.renew_lease(lease).await
+    }
+
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError> {
         self.inner.session_events(session_id).await
+    }
+
+    async fn in_doubt(&self) -> Result<Vec<Event>, StoreError> {
+        self.inner.in_doubt().await
     }
 
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
@@ -135,7 +147,9 @@ impl EventStore for FaultyStore {
 /// - `observe` records what the log held at the moment the tool ran.
 /// - `wait` runs only once the test calls `release`.
 /// - `reject` answers with a JSON-RPC error.
-/// - Every tool is listed with `annotations`, and `listings` counts the listings.
+/// - Every tool is listed with `annotations` and `input_schema`, and `listings` counts
+///   the listings.
+/// - `received` holds the arguments of every call, in order.
 #[derive(Clone)]
 pub struct Probe {
     pub store: Arc<dyn EventStore>,
@@ -144,7 +158,9 @@ pub struct Probe {
     pub received_meta: Arc<Mutex<Option<RequestMetaObject>>>,
     pub stall_listing: bool,
     pub annotations: Option<ToolAnnotations>,
+    pub input_schema: serde_json::Value,
     pub listings: Arc<AtomicUsize>,
+    pub received: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     pub gate: Arc<Semaphore>,
     pub started: Arc<AtomicUsize>,
     pub finished: Arc<AtomicUsize>,
@@ -159,7 +175,9 @@ impl Probe {
             received_meta: Arc::default(),
             stall_listing: false,
             annotations: None,
+            input_schema: serde_json::json!({"type": "object"}),
             listings: Arc::default(),
+            received: Arc::default(),
             gate: Arc::new(Semaphore::new(0)),
             started: Arc::default(),
             finished: Arc::default(),
@@ -189,12 +207,7 @@ impl ServerHandler for Probe {
         if self.stall_listing {
             std::future::pending::<()>().await;
         }
-        let schema = Arc::new(
-            serde_json::json!({"type": "object"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
+        let schema = Arc::new(self.input_schema.as_object().unwrap().clone());
         let tools = ["observe", "wait", "reject"]
             .into_iter()
             .map(|name| {
@@ -212,6 +225,8 @@ impl ServerHandler for Probe {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         self.started.fetch_add(1, Ordering::SeqCst);
+        let arguments = serde_json::json!(request.arguments);
+        self.received.lock().unwrap().push(arguments);
         *self.received_meta.lock().await = Some(context.meta);
         match request.name.as_ref() {
             "observe" => {

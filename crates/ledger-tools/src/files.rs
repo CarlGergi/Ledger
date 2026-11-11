@@ -21,6 +21,14 @@ pub struct WriteFileRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppendFileRequest {
+    /// Path relative to the server's root directory.
+    pub path: String,
+    /// UTF-8 text to add to the end of the file.
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileRequest {
     /// Path relative to the server's root directory.
     pub path: String,
@@ -121,6 +129,40 @@ impl FileServer {
         write_atomically(&target, request.content.as_bytes())
             .await
             .map_err(|e| format!("could not write {:?}: {e}", request.path))?;
+        Ok(Json(WriteFileResponse {
+            bytes_written: request.content.len() as u64,
+            path: request.path,
+        }))
+    }
+
+    /// Add text to the end of a file, creating it if needed. Every call adds the text
+    /// again, so it is safe to run at most once.
+    #[tool(annotations(
+        title = "Append to file",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn append_file(
+        &self,
+        Parameters(request): Parameters<AppendFileRequest>,
+    ) -> Result<Json<WriteFileResponse>, String> {
+        let target = self.resolve(&request.path).await?;
+        let append = async {
+            let parent = target.parent().expect("resolved paths have a parent");
+            tokio::fs::create_dir_all(parent).await?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&target)
+                .await?;
+            file.write_all(request.content.as_bytes()).await?;
+            file.sync_data().await
+        };
+        append
+            .await
+            .map_err(|e| format!("could not append to {:?}: {e}", request.path))?;
         Ok(Json(WriteFileResponse {
             bytes_written: request.content.len() as u64,
             path: request.path,
@@ -252,6 +294,32 @@ mod tests {
         let schema = FileServer::write_file_tool_attr().output_schema.unwrap();
         let bytes_written = &schema["properties"]["bytes_written"];
         assert!(bytes_written.get("format").is_none(), "{bytes_written}");
+    }
+
+    #[tokio::test]
+    async fn appending_adds_to_the_end_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = FileServer::new(dir.path()).unwrap();
+        let append = |content: &str| {
+            Parameters(AppendFileRequest {
+                path: "log/a.txt".to_owned(),
+                content: content.to_owned(),
+            })
+        };
+        server.append_file(append("one\n")).await.unwrap();
+        server.append_file(append("two\n")).await.unwrap();
+        server.append_file(append("two\n")).await.unwrap();
+        let read = server.read_file(read("log/a.txt")).await.unwrap().0;
+        assert_eq!(read.content, "one\ntwo\ntwo\n");
+        assert!(
+            server
+                .append_file(Parameters(AppendFileRequest {
+                    path: "../out".to_owned(),
+                    content: "x".to_owned(),
+                }))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
