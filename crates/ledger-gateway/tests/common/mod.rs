@@ -364,6 +364,10 @@ impl Stack {
         session
     }
 
+    pub fn db_url(&self) -> &str {
+        self._db.url()
+    }
+
     pub async fn events(&self, session: &str) -> Vec<Event> {
         self.store.session_events(session).await.unwrap()
     }

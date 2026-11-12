@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop vscode vscode-package soak demo demo-model stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -11,6 +11,7 @@ help:
 	@echo "make interop    drive the gateway with the official TypeScript MCP client"
 	@echo "make vscode     type-check and test the VS Code extension"
 	@echo "make vscode-package  build vscode/out/ledger.vsix to install"
+	@echo "make regress    replay three recorded runs on each scripted model and report changes"
 	@echo "make soak       repeat the test suite under load, about 30 minutes; not part of reproduce"
 	@echo "make demo       run the sample agent and print its log"
 	@echo "make stack      run the gateway and tool servers until interrupted"
@@ -61,6 +62,9 @@ demo: db-up
 	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
 		target/debug/sample-agent --session $$session && target/debug/ledger log $$session'
 
+regress: db-up
+	scripts/with-stack.sh scripts/regress.sh
+
 # The same task, decided by the scripted model reporter-1 through the gateway's model proxy.
 demo-model: db-up
 	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
@@ -75,7 +79,7 @@ sessions:
 log:
 	cargo run --quiet --package ledger-gateway --bin ledger -- log $(SESSION)
 
-reproduce: lint test breakage simulate interop vscode
+reproduce: lint test breakage simulate interop regress vscode
 
 clean:
 	cargo clean

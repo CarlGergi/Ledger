@@ -31,6 +31,8 @@ RETRIES = "crates/ledger-store/migrations/0003_retries.sql"
 MODEL_CALLS = "crates/ledger-store/migrations/0004_model_calls.sql"
 MODEL = "crates/ledger-gateway/src/model.rs"
 FORK = "crates/ledger-gateway/src/fork.rs"
+COMPARE = "crates/ledger-gateway/src/compare.rs"
+REGRESS = "crates/ledger-gateway/src/regress.rs"
 EVENT = "crates/ledger-store/src/event.rs"
 MEMORY = "crates/ledger-store/src/memory.rs"
 SIM_TEST = "the_first_seeds_keep_every_invariant"
@@ -680,6 +682,48 @@ FAULTS = [
         "a_fork_cannot_take_a_started_session_or_name_a_missing_source",
         MEMORY,
         [("        if state.sessions.contains_key(&fork.session_id) {\n            return Err(StoreError::SessionExists", "        if state.sessions.contains_key(&fork.session_id) && fork.at_step < 0 {\n            return Err(StoreError::SessionExists")],
+    ),
+    Fault(
+        "replay: a replay runs its tool calls",
+        "a_model_that_emails_differently_diverges_at_the_email",
+        REGRESS,
+        [("        tools: ToolMode::Replay,", "        tools: ToolMode::Live,")],
+    ),
+    Fault(
+        "replay: a replay keeps the recorded model",
+        "a_model_that_emails_differently_diverges_at_the_email",
+        REGRESS,
+        [("        model: Some(model.to_owned()),", "        model: Some(model.to_owned()).filter(|_| false),")],
+    ),
+    Fault(
+        "replay: tool calls are compared by name alone",
+        "a_model_that_emails_differently_diverges_at_the_email",
+        COMPARE,
+        [("            ) => a == b && x == y,", "            ) => a == b && (x == y || true),")],
+    ),
+    Fault(
+        "replay: the final answer is not compared",
+        "another_answer_diverges_at_the_end",
+        COMPARE,
+        [("        && message[\"tool_calls\"].as_array().is_none_or(Vec::is_empty)", "        && message[\"tool_calls\"].as_array().is_none_or(Vec::is_empty)\n        && reply.seq < 0")],
+    ),
+    Fault(
+        "replay: calls answered from the log count as run",
+        "a_replay_on_the_same_model_acts_the_same_and_runs_no_tool",
+        COMPARE,
+        [("                _ if !event.payload[\"replayed_from\"].is_null() => cost.tools_from_log += 1,", "                _ if event.payload[\"replayed_from\"].is_null() && false => cost.tools_from_log += 1,")],
+    ),
+    Fault(
+        "replay: an agent that fails counts as the same",
+        "regress_runs_the_suites_agent_for_each_session_and_counts_the_outcomes",
+        GATEWAY_MAIN,
+        [("                    (Err(_), _) => failed += 1,", "                    (Err(_), _) => same += 1,")],
+    ),
+    Fault(
+        "replay: --fail-on-divergence is ignored",
+        "regress_runs_the_suites_agent_for_each_session_and_counts_the_outcomes",
+        GATEWAY_MAIN,
+        [("                !fail_on_divergence || diverged + failed == 0,", "                !fail_on_divergence || diverged + failed < usize::MAX,")],
     ),
 ]
 

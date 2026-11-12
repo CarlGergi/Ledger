@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use ledger_gateway::regress::{self, Suite};
 use ledger_gateway::{Config, Gateway, McpUpstream, ModelUpstream, Upstream};
 use ledger_store::{Event, EventKind, EventStore, Fork, PgEventStore, ToolMode};
 use tokio::net::TcpListener;
@@ -71,6 +72,45 @@ enum Command {
         /// The new session's id. Defaults to `<source>.fork-<8 hex digits>`.
         #[arg(long = "as")]
         session: Option<String>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Start a replay of a session on another model, with every tool call answered from its
+    /// log. Prints the replay's id: run the agent again under it, then `ledger compare`.
+    Replay {
+        source: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Compare a replay, or any fork, with the session it came from: where they first act
+    /// differently, and what each cost.
+    Compare {
+        source: String,
+        replay: String,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Replay every session in a suite on a new model, running the suite's agent command for
+    /// each against a running gateway, and report where behaviour changed.
+    Regress {
+        suite: PathBuf,
+        /// Replay on this model instead of the suite's.
+        #[arg(long)]
+        model: Option<String>,
+        /// How long one agent run may take.
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+        /// Exit with failure if any run diverged or its agent failed.
+        #[arg(long)]
+        fail_on_divergence: bool,
+        /// Print one JSON report per run.
+        #[arg(long)]
+        json: bool,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -154,6 +194,80 @@ async fn main() -> anyhow::Result<()> {
             };
             store.create_fork(&fork).await?;
             println!("{session}");
+            Ok(())
+        }
+        Command::Replay {
+            source,
+            model,
+            database_url,
+        } => {
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
+            println!("{}", regress::start_replay(&store, &source, &model).await?);
+            Ok(())
+        }
+        Command::Compare {
+            source,
+            replay,
+            json,
+            database_url,
+        } => {
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
+            let report = regress::report(&store, &source, &replay).await?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                print_report(&report);
+            }
+            Ok(())
+        }
+        Command::Regress {
+            suite,
+            model,
+            timeout_secs,
+            fail_on_divergence,
+            json,
+            database_url,
+        } => {
+            let mut suite = Suite::load(&suite)?;
+            if let Some(model) = model {
+                suite.model = model;
+            }
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
+            let timeout = Duration::from_secs(timeout_secs);
+            let (mut same, mut diverged, mut failed) = (0, 0, 0);
+            for run in &suite.runs {
+                let replay = regress::start_replay(&store, &run.session, &suite.model).await?;
+                let agent = run_agent(&suite.command(run, &replay), timeout).await;
+                let report = regress::report(&store, &run.session, &replay).await?;
+                match (&agent, report.same()) {
+                    (Err(_), _) => failed += 1,
+                    (Ok(()), true) => same += 1,
+                    (Ok(()), false) => diverged += 1,
+                }
+                if json {
+                    let mut line = serde_json::to_value(&report)?;
+                    line["agent_error"] =
+                        serde_json::json!(agent.as_ref().err().map(|e| format!("{e:#}")));
+                    println!("{line}");
+                    continue;
+                }
+                print_report(&report);
+                if let Err(e) = &agent {
+                    println!("  the agent failed: {e:#}");
+                }
+                println!();
+            }
+            if !json {
+                println!(
+                    "{} runs on {}: {same} same, {diverged} diverged, {failed} failed",
+                    suite.runs.len(),
+                    suite.model
+                );
+            }
+            anyhow::ensure!(
+                !fail_on_divergence || diverged + failed == 0,
+                "{diverged} runs diverged and {failed} failed"
+            );
             Ok(())
         }
         Command::Log {
@@ -241,6 +355,51 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     ledger_gateway::serve(gateway, listener, config.allowed_hosts, shutdown).await?;
     Ok(())
+}
+
+fn print_report(report: &ledger_gateway::compare::Report) {
+    println!(
+        "{} -> {}: {}",
+        report.source,
+        report.replay,
+        report.summary()
+    );
+    for (who, cost) in [
+        ("source", &report.source_cost),
+        ("replay", &report.replay_cost),
+    ] {
+        println!(
+            "  {who}: {} model calls, {} tokens; tools: {} run, {} from the log, {} refused",
+            cost.model_calls, cost.tokens, cost.tools_run, cost.tools_from_log, cost.tools_refused
+        );
+    }
+}
+
+/// Runs an agent to the end, keeping its output to report if it fails.
+async fn run_agent(command: &[String], timeout: Duration) -> anyhow::Result<()> {
+    let (program, args) = command.split_first().context("an empty agent command")?;
+    let child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting {program}"))?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("{program} did not finish within {timeout:?}"))??;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
+    let tail: Vec<&str> = tail.into_iter().rev().collect();
+    anyhow::bail!(
+        "{program} exited with {}: {}",
+        output.status,
+        tail.join(" / ")
+    )
 }
 
 fn summary(event: &Event) -> String {

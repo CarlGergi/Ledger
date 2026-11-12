@@ -2,7 +2,7 @@
 
 A crash-safe gateway and time-travel debugger for AI agents. Ledger sits between an agent and the tools it calls through [MCP](https://modelcontextprotocol.io). The agent connects to Ledger as if it were its tool server and needs no changes. Ledger records every call in PostgreSQL before forwarding it.
 
-**Status:** the gateway, retries and failover between gateway copies, the simulation, the VS Code extension, a proxy that logs model calls, and forking a session are working. Regression replay against a new model is next; see [Roadmap](#roadmap).
+**Status:** milestones 1 to 5 are working: the gateway, retries and failover between gateway copies, the simulation, the VS Code extension, a proxy that logs model calls, forking a session, and regression replay against a new model. Benchmarks, tracing and a cloud deployment are next; see [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -237,6 +237,41 @@ So by default a fork can explore what a new model would do without sending a sec
 
 Which source calls have been used is read from the fork's own log on every call, so a fork carries on correctly after a crash or on another gateway copy. A session can become a fork only before it has recorded anything: `ledger fork --as` refuses a session that exists.
 
+## Regression replay
+
+Before switching an agent to a new model, replay recorded runs on it. A replay is a fork at the first step in `replay` mode: every model call goes to the new model, and every tool call is answered from the recorded log or turned down, so nothing real happens.
+
+```bash
+ledger replay <session> --model <new-model>     # prints the replay's session id
+# run the agent again under that session, through the gateway
+ledger compare <session> <replay>               # add --json for the full report
+```
+
+`ledger compare` reports the first step where the two runs act differently. What a run does is the tool calls it asks for, each with its arguments, then the model's final answer. Model calls are not compared one by one, because a new model may word its requests differently and still do the same thing. It also reports what each run cost: model calls, tokens as the model reported them, and tool calls run, answered from the log, or turned down.
+
+For a whole suite, `ledger regress` does all three for every session in a file, against a running gateway:
+
+```toml
+model = "gpt-5-mini"
+agent = ["my-agent", "--session", "{session}"]
+
+[[run]]
+session = "run-1"
+args = ["--task", "Write the daily report."]
+```
+
+Each run's `args` follow the agent command, so the agent gets the same task as when the run was recorded. `--model` replays on another model than the file's, `--json` prints one report per run, and `--fail-on-divergence` makes any change, or any agent that fails, an error, for CI.
+
+Results of `make regress`, which records three runs with the scripted `reporter-1` and replays them on each scripted model:
+
+| Replayed on | Same | Diverged | Where | Tools run by the replays | Answered from the log | Turned down |
+| --- | --: | --: | --- | --: | --: | --: |
+| `reporter-1` | 3 | 0 | | 0 | 6 | 0 |
+| `reporter-2` | 0 | 3 | Step 2: the same email with another subject | 0 | 3 | 3 |
+| `reporter-3` | 0 | 3 | Step 2: reads the report back instead of emailing it | 0 | 6 | 3 |
+
+The six recorded tool calls were never run again: each replay was answered from the log or turned down. The scripted models' token counts are a quarter of the characters they handle, not real tokens, so they are left out here.
+
 ## Simulation
 
 `make simulate` runs 10,000 seeds of a deterministic simulation. Each seed sets up three gateway copies sharing one store, a tool server, and two to five agents, all in one thread. Every random choice comes from one generator seeded by the seed, and every timer runs in simulated time. So a seed replays exactly, and a failing one prints the command that replays it with a full trace:
@@ -287,6 +322,7 @@ The simulator has not found a bug in Ledger itself. What it did find was a blind
 | `make breakage` | Breaks each guarantee in turn and checks that the test protecting it fails |
 | `make simulate` | Runs 10,000 seeds of the deterministic simulation |
 | `make interop` | Drives the gateway with the official TypeScript MCP client, configured only with a URL |
+| `make regress` | Records three runs, replays them on each scripted model, and reports where each changed |
 | `make vscode` | Type-checks and tests the VS Code extension |
 | `make reproduce` | Runs all of the above, plus lint |
 | `make soak` | Repeats the whole suite under load, and fails on any failed run, PostgreSQL reset, or leftover database. About 30 minutes on a busy machine, so it is not part of `make reproduce` |
@@ -331,7 +367,7 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 | `crates/sample-agent` | MCP clients: a scripted one, and one that a model drives |
 | `vscode` | The VS Code extension |
 | `interop/typescript` | Interoperability check with the official client |
-| `scripts` | The breakage check, the soak, and a helper that runs the full stack |
+| `scripts` | The breakage check, the soak, the regression replay demo, and a helper that runs the full stack |
 | `.github/workflows` | CI: lint and every test, against PostgreSQL |
 
 ## Current limits
@@ -353,5 +389,5 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 2. ~~Effect policy from MCP annotations, deduplication, idempotency keys, leases with fencing tokens~~
 3. ~~Deterministic simulation testing with fault injection~~
 4. ~~VS Code extension: timeline, inspect, replay~~
-5. Model proxy, forking a session at any step, regression replay against a new model
+5. ~~Model proxy, forking a session at any step, regression replay against a new model~~
 6. Benchmarks, OpenTelemetry, Azure deployment, a real email demo

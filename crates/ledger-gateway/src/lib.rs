@@ -2,12 +2,14 @@
 //! every tool call in the event log and forwards it to the real server. It can also stand
 //! in for an OpenAI-compatible model, logging each model call in the same session.
 
+pub mod compare;
 mod config;
 mod dedup;
 mod fork;
 mod gateway;
 mod model;
 mod policy;
+pub mod regress;
 mod server;
 mod session;
 mod upstream;

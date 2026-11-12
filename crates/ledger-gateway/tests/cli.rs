@@ -363,3 +363,105 @@ async fn the_fork_command_starts_a_fork_that_the_log_names() {
     assert!(refused(&["fork", "src", "--at", "1", "--as", "f1"]).contains("already exists"));
     assert!(refused(&["fork", "src", "--at", "1", "--tools", "all"]).contains("safe"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_and_compare_report_where_a_new_model_diverges() {
+    let stack = common::Stack::start().await;
+
+    let (ok, replay) = ledger_output(&["replay", "src", "--model", "reporter-2"], stack.db_url());
+    assert!(ok);
+    let replay = replay.trim();
+    stack.run(replay, common::REPORT).await.unwrap();
+
+    let (ok, text) = ledger_output(&["compare", "src", replay], stack.db_url());
+    assert!(ok);
+    let first = text.lines().next().unwrap();
+    assert!(
+        first.starts_with(&format!(
+            "src -> {replay}: diverges at step 2: email__send_email"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("replay: 3 model calls"), "{text}");
+    assert!(
+        text.contains("tools: 0 run, 1 from the log, 1 refused"),
+        "{text}"
+    );
+    let (ok, json) = ledger_output(&["compare", "src", replay, "--json"], stack.db_url());
+    assert!(ok);
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["divergence"]["step"], 2);
+    assert_eq!(report["replay_cost"]["tools_run"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regress_runs_the_suites_agent_for_each_session_and_counts_the_outcomes() {
+    let stack = common::Stack::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let suite = |name: &str, agent: &str| {
+        let path = dir.path().join(format!("{name}.toml"));
+        let text = format!(
+            "model = \"reporter-2\"\nagent = [\"sh\", \"-c\", {agent:?}, \"agent\", \"{{session}}\"]\n\
+             [[run]]\nsession = \"src\"\n[[run]]\nsession = \"src\"\nargs = [\"extra\"]\n"
+        );
+        std::fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let regress = |path: &str, extra: &[&str]| {
+        let output = Command::new(LEDGER)
+            .args(["regress", path])
+            .args(extra)
+            .env("DATABASE_URL", stack.db_url())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        (output.status.success(), stdout)
+    };
+
+    // An agent that does nothing: each replay records nothing, so it diverges at once.
+    // It is given the replay's session, and each run's own arguments.
+    let args = dir.path().join("args");
+    let echo = suite("echo", &format!("echo \"$@\" >> '{}'", args.display()));
+    let (ok, out) = regress(&echo, &[]);
+    assert!(ok, "{out}");
+    assert!(
+        out.ends_with("2 runs on reporter-2: 0 same, 2 diverged, 0 failed\n"),
+        "{out}"
+    );
+    let given = std::fs::read_to_string(&args).unwrap();
+    let given: Vec<&str> = given.lines().collect();
+    assert_eq!(given.len(), 2, "{given:?}");
+    assert!(
+        given[0].starts_with("src.replay-") && !given[0].contains(' '),
+        "{given:?}"
+    );
+    assert!(
+        given[1].starts_with("src.replay-") && given[1].ends_with(" extra"),
+        "{given:?}"
+    );
+    let (ok, _) = regress(&echo, &["--fail-on-divergence"]);
+    assert!(!ok);
+
+    let failing = suite("failing", "echo broken >&2; exit 3");
+    let (ok, out) = regress(&failing, &[]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("the agent failed: sh exited with exit status: 3: broken"),
+        "{out}"
+    );
+    assert!(out.ends_with("0 same, 0 diverged, 2 failed\n"), "{out}");
+
+    // An agent that never finishes is stopped at the limit. Only it gets a short one: it
+    // never finishes, so the limit is reached however loaded the machine is.
+    let (ok, out) = regress(&suite("sleeping", "sleep 600"), &["--timeout-secs", "1"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("did not finish within 1s"), "{out}");
+
+    // Another model on the command line wins over the suite's.
+    let (ok, out) = regress(&echo, &["--model", "reporter-3"]);
+    assert!(ok);
+    assert!(
+        out.ends_with("2 runs on reporter-3: 0 same, 2 diverged, 0 failed\n"),
+        "{out}"
+    );
+}
