@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod ports;
+
 use clap::Parser;
 use ledger_gateway::Gateway;
 use ledger_store::{EventKind, EventStore, Outcome, PgEventStore};
@@ -166,6 +168,7 @@ async fn run(args: &Args, arrangement: Arrangement, tool: Tool) -> anyhow::Resul
         Tool::Append => ("append_file", Result::default()),
     };
     let url = format!("{agent_url}/mcp");
+    ports::let_ports_drain().await;
     let mut agent = RetryingAgent::new(&url, session);
     for i in 0..args.calls {
         let arguments = match tool {
@@ -181,6 +184,10 @@ async fn run(args: &Args, arrangement: Arrangement, tool: Tool) -> anyhow::Resul
             .await;
         match delivery.result {
             Ok(_) => result.answered += 1,
+            // Not a lost answer: the machine, not the run, failed. The run is invalid.
+            Err(e) if ports::out_of_ports(&e) => {
+                anyhow::bail!("call {i}: the machine ran out of local ports: {e}")
+            }
             Err(_) => result.gave_up += 1,
         }
     }

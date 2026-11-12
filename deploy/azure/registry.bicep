@@ -1,5 +1,5 @@
-// A container registry for the gateway's image. Deployed first, so that `az acr build`
-// can build the image in Azure before the app that runs it exists.
+// A container registry for the gateway's image. Deployed first, so that the image can be
+// pushed to it before the app that runs it exists.
 
 @description('Lowercase letters and digits; names every resource.')
 @minLength(3)

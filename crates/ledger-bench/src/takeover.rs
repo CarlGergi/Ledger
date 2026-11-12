@@ -39,6 +39,9 @@ struct Args {
     /// How often the agent tries B, in milliseconds: the resolution of each measurement.
     #[arg(long, default_value_t = 10)]
     poll_ms: u64,
+    /// Also writes every trial to this file, as JSON, for the figures.
+    #[arg(long)]
+    json_out: Option<PathBuf>,
 }
 
 /// How A is stopped.
@@ -257,6 +260,7 @@ async fn main() {
         "| How A stopped | lease_secs | A's exit to B's answer, median | min | max | A's last event to B's answer, median | min | max |"
     );
     println!("| --- | --: | --: | --: | --: | --: | --: | --: |");
+    let mut records = Vec::new();
     for &lease in &args.lease_secs {
         let b = Copy::start(
             &ledger,
@@ -282,6 +286,13 @@ async fn main() {
                     result.refusals
                 );
                 trials.push(result);
+                records.push(json!({
+                    "lease_secs": lease,
+                    "stop": format!("{how:?}").to_lowercase(),
+                    "after_exit_s": result.after_kill.as_secs_f64(),
+                    "after_last_event_s": result.after_last_event.as_secs_f64(),
+                    "refusals": result.refusals,
+                }));
             }
             let (km, kmin, kmax) =
                 summary(&trials.iter().map(|t| t.after_kill).collect::<Vec<_>>());
@@ -303,6 +314,11 @@ async fn main() {
             );
         }
         b.stop(Stop::Kill);
+    }
+    if let Some(path) = &args.json_out {
+        let record = json!({ "machine": machine(), "poll_ms": args.poll_ms, "trials": records });
+        std::fs::write(path, serde_json::to_string_pretty(&record).expect("JSON"))
+            .expect("writing the JSON");
     }
 }
 

@@ -1,6 +1,10 @@
 // Ledger on Azure Container Apps, with its log in Azure Database for PostgreSQL and its
 // traces in Application Insights. deploy.sh runs this after building the image; see the
 // README's "Deploying to Azure".
+//
+// The production template. Some subscriptions, Azure for Students among them, get only
+// express environments, which refuse Application Insights, sidecars, secret volumes and
+// a termination grace period: for those, students.bicep.
 
 @description('Lowercase letters and digits; names every resource. The same as for registry.bicep.')
 @minLength(3)
@@ -121,6 +125,14 @@ resource environment 'Microsoft.App/managedEnvironments@2024-10-02-preview' = {
   name: '${namePrefix}-env-${suffix}'
   location: location
   properties: {
+    // A workload profiles environment with only the Consumption profile: billed per use,
+    // and able to run sidecars and the managed OpenTelemetry agent.
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
     appLogsConfiguration: {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {
@@ -158,6 +170,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
   dependsOn: [ pull, azureServices ]
   properties: {
     managedEnvironmentId: environment.id
+    workloadProfileName: 'Consumption'
     configuration: {
       ingress: {
         external: true

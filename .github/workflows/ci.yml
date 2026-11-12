@@ -53,3 +53,9 @@ jobs:
         run: |
           npm ci --prefix vscode
           npm test --prefix vscode
+      - name: Azure templates compile
+        run: |
+          az bicep install
+          for template in registry main students; do
+            az bicep build --file deploy/azure/$template.bicep --stdout >/dev/null
+          done

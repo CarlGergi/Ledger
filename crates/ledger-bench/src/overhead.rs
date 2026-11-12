@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod ports;
+
 use clap::Parser;
 use ledger_gateway::{Gateway, McpUpstream, Upstream};
 use ledger_store::{EventStore, PgEventStore};
@@ -42,6 +44,9 @@ struct Args {
     /// Checks the setup with one call through each arrangement, and measures nothing.
     #[arg(long)]
     dry_run: bool,
+    /// Also writes every sample to this file, as JSON, for the figures.
+    #[arg(long)]
+    json_out: Option<std::path::PathBuf>,
 }
 
 /// Percentiles of a set of durations, nearest-rank.
@@ -79,46 +84,30 @@ async fn read(client: &Client) {
             json!({ "path": "f.txt" }),
         ))
         .await
-        .expect("the call failed");
+        .unwrap_or_else(|e| {
+            let e = e.to_string();
+            if ports::out_of_ports(&e) {
+                panic!("the machine ran out of local ports, so this run is invalid: {e}");
+            }
+            panic!("the call failed: {e}")
+        });
 }
 
 thread_local! {
     static CALL_NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
-/// Waits until few sockets are left in TIME_WAIT. The MCP HTTP client opens a connection
-/// per request, and macOS keeps each closed one for about 30 seconds, so phases run back
-/// to back would run out of the ~16,000 local ports. Gives up waiting after two minutes.
-async fn let_ports_drain() {
-    let waiting = || {
-        std::process::Command::new("netstat")
-            .args(["-an", "-p", "tcp"])
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .filter(|l| l.contains("TIME_WAIT"))
-                    .count()
-            })
-            .unwrap_or(0)
-    };
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while waiting() > 1000 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
 struct Measured {
     sorted: Vec<Duration>,
-    /// Median of the session's first 100 calls, and of its last 100: Ledger reads the
-    /// session's log for each call, so a long session costs more per call.
+    /// Median of the session's first 100 calls, and of its last 100: whether a call costs
+    /// more once its session is long.
     early: Duration,
     late: Duration,
     per_second: f64,
 }
 
 async fn measure(url: &str, tool: &str, args: &Args) -> Measured {
-    let_ports_drain().await;
+    ports::let_ports_drain().await;
     CALL_NAME.with(|n| *n.borrow_mut() = tool.to_owned());
     // Warm up in a session of its own, so that the measured calls are a fresh session's
     // first to last.
@@ -147,7 +136,7 @@ async fn measure(url: &str, tool: &str, args: &Args) -> Measured {
     times.sort();
     client.cancel().await.ok();
 
-    let_ports_drain().await;
+    ports::let_ports_drain().await;
     let started = Instant::now();
     let mut clients = Vec::new();
     for c in 0..args.clients {
@@ -255,6 +244,26 @@ async fn main() -> anyhow::Result<()> {
         args.calls,
         ms(through.late)
     );
+    if let Some(path) = &args.json_out {
+        let samples = |m: &Measured| -> Vec<f64> {
+            m.sorted.iter().map(|d| d.as_secs_f64() * 1000.0).collect()
+        };
+        let record = json!({
+            "machine_before": before,
+            "machine_after": after,
+            "calls": args.calls,
+            "warmup": args.warmup,
+            "clients": args.clients,
+            "calls_per_client": args.calls_per_client,
+            "direct_ms": samples(&direct),
+            "ledger_ms": samples(&through),
+            "ledger_early_median_ms": through.early.as_secs_f64() * 1000.0,
+            "ledger_late_median_ms": through.late.as_secs_f64() * 1000.0,
+            "direct_per_second": direct.per_second,
+            "ledger_per_second": through.per_second,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&record)?)?;
+    }
     let added = |p| percentile(&through.sorted, p).saturating_sub(percentile(&direct.sorted, p));
     println!(
         "\nAdded by Ledger: {} ms at p50, {} ms at p99",

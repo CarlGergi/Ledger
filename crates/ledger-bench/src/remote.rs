@@ -181,7 +181,9 @@ async fn wait(url: &str, session: &str, step: &str, patience: Duration) {
         let delivery = agent
             .call(step, "files__read_file", json!({ "path": "remote.txt" }), 1)
             .await;
-        if answered(&delivery) {
+        // Any answer from the tool counts, even an error: a copy that refuses the session
+        // answers with a JSON-RPC error instead. After a restart the file may be gone.
+        if delivery.result.is_ok() {
             break;
         }
         refusals += 1;

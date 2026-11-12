@@ -1,4 +1,9 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local demo-email bench-duplicates bench-overhead bench-takeover stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local demo-email azure-check bench-duplicates bench-overhead bench-takeover stack sessions log reproduce clean
+
+# The development database (docker compose), unless one is named. Binaries run directly,
+# not through cargo, need it from here.
+DATABASE_URL ?= postgres://ledger:ledger@127.0.0.1:55432/ledger
+export DATABASE_URL
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -22,6 +27,7 @@ help:
 	@echo "make stack      run the gateway and tool servers until interrupted"
 	@echo "make sessions   list recorded sessions"
 	@echo "make log SESSION=<id>  print a session's events"
+	@echo "make azure-check  compile the Azure templates (needs the Azure CLI); creates nothing"
 	@echo "make reproduce  run all of the above checks"
 
 db-up:
@@ -86,17 +92,32 @@ agentmail-local: db-up
 	scripts/agentmail-demo.sh --local
 
 bench-duplicates: db-up
-	for loss in 0.1 0.3; do \
-		cargo run --quiet --release -p ledger-bench --bin duplicates -- --calls 1000 --loss $$loss --seed 1 || exit 1; \
-		echo; done
+	cargo build --quiet --release -p ledger-bench --bin duplicates
+	mkdir -p results
+	rm -f results/duplicates.jsonl
+	for loss in 0.1 0.3; do for seed in 1 2 3 4 5 6 7 8 9 10; do \
+		target/release/duplicates --calls 1000 --loss $$loss --seed $$seed --json >results/run.jsonl || exit 1; \
+		jq -c --argjson seed $$seed '. + {seed: $$seed}' results/run.jsonl >>results/duplicates.jsonl || exit 1; \
+		done; done
+	rm -f results/run.jsonl
+	python3 scripts/figures.py
 
 # Timings mislead on a busy machine; the binary refuses to measure without the flag.
+azure-check:
+	for template in registry main students; do \
+		az bicep build --file deploy/azure/$$template.bicep --stdout >/dev/null || exit 1; done
+	@echo "the Azure templates compile"
+
 bench-takeover: db-up
 	cargo build --quiet --release -p ledger-gateway -p ledger-bench
-	target/release/takeover
+	mkdir -p results
+	target/release/takeover --json-out results/takeover.json
+	python3 scripts/figures.py
 
 bench-overhead: db-up
-	cargo run --quiet --release -p ledger-bench --bin overhead -- --machine-is-quiet
+	mkdir -p results
+	cargo run --quiet --release -p ledger-bench --bin overhead -- --machine-is-quiet --json-out results/overhead.json
+	python3 scripts/figures.py
 
 stack: db-up
 	scripts/with-stack.sh sh -c 'echo "gateway on http://127.0.0.1:7100/mcp; Ctrl-C to stop"; while :; do sleep 3600; done'

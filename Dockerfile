@@ -6,7 +6,9 @@
 # The config must listen on 0.0.0.0, and name the host clients use in allowed_hosts.
 FROM rust:1.99-slim-trixie AS build
 WORKDIR /src
-COPY . .
+# Only what the build reads, so that a change anywhere else reuses the cached build.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
 RUN cargo build --release --locked -p ledger-gateway --bin ledger \
     && cargo build --release --locked -p ledger-tools --bin file-server
 
