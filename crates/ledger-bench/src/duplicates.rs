@@ -93,6 +93,8 @@ struct Result {
     answered: usize,
     /// Calls whose agent gave up, told the outcome is unknown.
     gave_up: usize,
+    /// Why the agent gave up, by the start of the last error it got.
+    gave_up_because: std::collections::BTreeMap<String, usize>,
     /// Through Ledger: retries answered from the log, without running anything.
     from_log: usize,
     /// Through Ledger: calls run again with the same idempotency key.
@@ -177,6 +179,7 @@ async fn run(args: &Args, arrangement: Arrangement, tool: Tool) -> anyhow::Resul
             }
             Tool::Append => json!({ "path": "effects.log", "content": format!("call {i}\n") }),
         };
+        ports::keep_ports_free().await;
         let step = i.to_string();
         let tool_name = format!("{prefix}{name}");
         let delivery = agent
@@ -185,10 +188,16 @@ async fn run(args: &Args, arrangement: Arrangement, tool: Tool) -> anyhow::Resul
         match delivery.result {
             Ok(_) => result.answered += 1,
             // Not a lost answer: the machine, not the run, failed. The run is invalid.
-            Err(e) if ports::out_of_ports(&e) => {
-                anyhow::bail!("call {i}: the machine ran out of local ports: {e}")
+            Err(e) if ports::could_not_connect(&e) => {
+                anyhow::bail!(
+                    "call {i}: could not reach a local server, so this run is invalid: {e}"
+                )
             }
-            Err(_) => result.gave_up += 1,
+            Err(e) => {
+                result.gave_up += 1;
+                let reason: String = e.chars().take(60).collect();
+                *result.gave_up_because.entry(reason).or_default() += 1;
+            }
         }
     }
 

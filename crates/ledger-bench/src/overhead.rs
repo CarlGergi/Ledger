@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// Shared with the other benchmarks; this one uses only part of it.
+#[allow(dead_code)]
 mod ports;
 
 use clap::Parser;
