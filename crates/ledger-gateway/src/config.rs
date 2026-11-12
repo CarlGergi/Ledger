@@ -25,6 +25,10 @@ pub struct Config {
     /// may take it over. Zero lets any copy take any session at once.
     #[serde(default = "default_lease_secs")]
     pub lease_secs: u64,
+    /// How long a stopping gateway waits for calls already running to finish and log their
+    /// answers. Keep it under the platform's own limit: Azure Container Apps allows 30s.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
     /// Extra `Host` values to accept. Empty means loopback only.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
@@ -35,6 +39,29 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     /// An OpenAI-compatible model to proxy, logging each call in the agent's session.
     pub model: Option<ModelConfig>,
+    /// Where to send traces and metrics. Without it, they go where the standard
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` variable says, or nowhere if it is not set.
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// An OTLP/HTTP collector, such as `http://localhost:4318`.
+    pub otlp_endpoint: String,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// How often metrics are sent.
+    #[serde(default = "default_metrics_interval_secs")]
+    pub metrics_interval_secs: u64,
+}
+
+fn default_service_name() -> String {
+    "ledger".to_owned()
+}
+
+fn default_metrics_interval_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -87,6 +114,10 @@ fn default_connect_timeout_secs() -> u64 {
     5
 }
 
+fn default_shutdown_grace_secs() -> u64 {
+    25
+}
+
 fn default_lease_secs() -> u64 {
     crate::gateway::DEFAULT_LEASE_TTL.as_secs()
 }
@@ -133,6 +164,10 @@ impl Config {
         Duration::from_secs(self.lease_secs)
     }
 
+    pub fn shutdown_grace(&self) -> Duration {
+        Duration::from_secs(self.shutdown_grace_secs)
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             self.call_timeout_secs > 0,
@@ -146,6 +181,17 @@ impl Config {
             !self.upstreams.is_empty(),
             "at least one [[upstream]] is required"
         );
+        if let Some(telemetry) = &self.telemetry {
+            ensure!(
+                telemetry.otlp_endpoint.starts_with("http://")
+                    || telemetry.otlp_endpoint.starts_with("https://"),
+                "telemetry otlp_endpoint must start with http:// or https://"
+            );
+            ensure!(
+                telemetry.metrics_interval_secs > 0,
+                "telemetry metrics_interval_secs must be positive"
+            );
+        }
         if let Some(model) = &self.model {
             ensure!(
                 model.timeout_secs > 0,
@@ -192,11 +238,30 @@ mod tests {
         assert_eq!(config.call_timeout(), Duration::from_secs(60));
         assert_eq!(config.connect_timeout(), Duration::from_secs(5));
         assert_eq!(config.lease_ttl(), Duration::from_secs(30));
+        assert_eq!(config.shutdown_grace(), Duration::from_secs(25));
         assert_eq!(config.database_url, None);
         assert!(config.allowed_hosts.is_empty());
         assert_eq!(config.effect_overrides, None);
         assert_eq!(config.upstreams[0].name, "email");
         assert_eq!(config.model, None);
+        assert_eq!(config.telemetry, None);
+    }
+
+    #[test]
+    fn telemetry_can_be_configured() {
+        let text = format!("{UPSTREAMS}\n[telemetry]\notlp_endpoint = \"http://otel:4318\"\n");
+        let telemetry = Config::parse(&text).unwrap().telemetry.unwrap();
+        assert_eq!(telemetry.otlp_endpoint, "http://otel:4318");
+        assert_eq!(telemetry.service_name, "ledger");
+        assert_eq!(telemetry.metrics_interval_secs, 60);
+        for bad in [
+            "otlp_endpoint = \"otel:4318\"",
+            "otlp_endpoint = \"http://otel:4318\"\nmetrics_interval_secs = 0",
+            "service_name = \"x\"",
+        ] {
+            let text = format!("{UPSTREAMS}\n[telemetry]\n{bad}\n");
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

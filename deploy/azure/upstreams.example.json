@@ -1,0 +1,4 @@
+[
+  { "name": "email", "url": "https://email-tools.example.com/mcp" },
+  { "name": "files", "url": "https://file-tools.example.com/mcp" }
+]

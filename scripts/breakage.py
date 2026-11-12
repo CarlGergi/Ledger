@@ -33,6 +33,11 @@ MODEL = "crates/ledger-gateway/src/model.rs"
 FORK = "crates/ledger-gateway/src/fork.rs"
 COMPARE = "crates/ledger-gateway/src/compare.rs"
 REGRESS = "crates/ledger-gateway/src/regress.rs"
+TELEMETRY = "crates/ledger-gateway/src/telemetry.rs"
+AGENTMAIL = "crates/ledger-tools/src/agentmail.rs"
+LOSSY = "crates/ledger-tools/src/lossy.rs"
+LOOKUP = "crates/ledger-store/src/lookup.rs"
+CALL_LOOKUP = "crates/ledger-store/migrations/0006_call_lookup.sql"
 EVENT = "crates/ledger-store/src/event.rs"
 MEMORY = "crates/ledger-store/src/memory.rs"
 SIM_TEST = "the_first_seeds_keep_every_invariant"
@@ -358,16 +363,18 @@ FAULTS = [
         RETURNING last_seq
     )
     INSERT INTO events
-        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token)
-    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8 FROM bumped""",
+        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token,
+         ask_step, ask_transport, ask_rpc_id)
+    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8, $10, $11, $12 FROM bumped""",
                 """    ), bumped AS (
         INSERT INTO sessions (session_id, last_seq) VALUES ($1, 1)
         ON CONFLICT (session_id) DO UPDATE SET last_seq = sessions.last_seq + 1
         RETURNING last_seq
     )
     INSERT INTO events
-        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token)
-    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8 FROM bumped, fence""",
+        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token,
+         ask_step, ask_transport, ask_rpc_id)
+    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8, $10, $11, $12 FROM bumped, fence""",
             )
         ],
     ),
@@ -725,6 +732,156 @@ FAULTS = [
         GATEWAY_MAIN,
         [("                !fail_on_divergence || diverged + failed == 0,", "                !fail_on_divergence || diverged + failed < usize::MAX,")],
     ),
+    Fault(
+        "telemetry: a call's span ignores the agent's trace",
+        "the_agents_trace_runs_through_the_gateway_and_on_to_the_model",
+        TELEMETRY,
+        [("        let parent = traceparent.map(parent_context).unwrap_or_default();", "        let parent = traceparent.filter(|_| false).map(parent_context).unwrap_or_default();")],
+    ),
+    Fault(
+        "telemetry: the model is not told the trace",
+        "the_agents_trace_runs_through_the_gateway_and_on_to_the_model",
+        MODEL,
+        [("            request = request.header(\"traceparent\", traceparent);", "            let _ = traceparent;")],
+    ),
+    Fault(
+        "telemetry: a retry answered from the log is reported as new",
+        "a_retry_answered_from_the_log_says_so",
+        GATEWAY,
+        [("                    span.decided(\"retry_from_log\");", "")],
+    ),
+    Fault(
+        "telemetry: a call flagged in doubt is not counted",
+        "a_call_left_in_doubt_is_traced_and_counted",
+        GATEWAY,
+        [("                self.inner.telemetry.flagged_in_doubt(\"retry\");", "")],
+    ),
+    Fault(
+        "telemetry: a call in doubt is reported as ok",
+        "a_call_left_in_doubt_is_traced_and_counted",
+        GATEWAY,
+        [("                Some(Value::Bool(true)) => \"in_doubt\",", "                Some(Value::Bool(true)) => \"ok\",")],
+    ),
+    Fault(
+        "telemetry: a takeover is counted as a new session",
+        "a_takeover_and_a_fenced_append_are_counted",
+        GATEWAY,
+        [("        self.inner.telemetry.lease_taken(lease.token);", "        self.inner.telemetry.lease_taken(1);")],
+    ),
+    Fault(
+        "telemetry: a fenced append is not counted",
+        "a_takeover_and_a_fenced_append_are_counted",
+        GATEWAY,
+        [("                self.inner.telemetry.fenced();", "")],
+    ),
+    Fault(
+        "telemetry: what is buffered is lost on exit",
+        "the_binary_sends_its_traces_and_metrics_to_the_configured_collector",
+        GATEWAY_MAIN,
+        [("    if let Some((traces, metrics)) = providers {", "    if let Some((traces, metrics)) = providers.map(std::mem::forget).and(None::<(SdkTracerProvider, SdkMeterProvider)>) {")],
+    ),
+    Fault(
+        "agentmail: the key is not passed to AgentMail",
+        "through_ledger_an_answer_lost_on_the_way_from_the_tool_sends_once",
+        AGENTMAIL,
+        [("            request = request.header(\"Idempotency-Key\", agentmail_key(key));", "            let _ = key;")],
+    ),
+    Fault(
+        "agentmail: Ledger's key is passed on as it is",
+        "through_ledger_an_answer_lost_on_the_way_from_the_tool_sends_once",
+        AGENTMAIL,
+        [("            request = request.header(\"Idempotency-Key\", agentmail_key(key));", "            request = request.header(\"Idempotency-Key\", key);")],
+    ),
+    Fault(
+        "agentmail: the tool does not declare its key, so Ledger cannot use one",
+        "through_ledger_an_answer_lost_on_the_way_from_the_tool_sends_once",
+        AGENTMAIL,
+        [("    pub idempotency_key: Option<String>,", "    #[serde(rename = \"dedup_token\")]\n    pub idempotency_key: Option<String>,")],
+    ),
+    Fault(
+        "agentmail: the stand-in for AgentMail ignores idempotency keys",
+        "a_repeated_key_returns_the_first_message_and_sends_nothing",
+        AGENTMAIL,
+        [("        && let Some((earlier, answer)) = state.keys.get(key)", "        && let Some((earlier, answer)) = state.keys.get(key).filter(|_| false)")],
+    ),
+    Fault(
+        "agentmail: the demo's proxy loses nothing",
+        "connected_straight_to_the_tool_a_lost_answer_sends_the_email_twice",
+        LOSSY,
+        [("    let lose = is_tool_call(&body) && proxy.take_one_to_lose();", "    let lose = is_tool_call(&body) && proxy.take_one_to_lose() && false;")],
+    ),
+    Fault(
+        "shutdown: SIGTERM is ignored",
+        "sigterm_lets_a_running_call_finish_and_log_its_answer",
+        GATEWAY_MAIN,
+        [("                _ = terminate.recv() => {}", "                _ = std::future::pending::<Option<()>>() => { let _ = &mut terminate; }")],
+    ),
+    Fault(
+        "shutdown: running calls are not waited for",
+        "sigterm_lets_a_running_call_finish_and_log_its_answer",
+        GATEWAY_MAIN,
+        [("            if !gateway.drain(grace).await {", "            if !gateway.drain(grace.min(std::time::Duration::ZERO)).await {")],
+    ),
+    Fault(
+        "shutdown: new tool calls are taken while shutting down",
+        "a_gateway_is_ready_until_it_starts_shutting_down",
+        GATEWAY,
+        [("        if self.is_draining() {\n            return Err(ErrorData::new(", "        if self.is_draining() && false {\n            return Err(ErrorData::new(")],
+    ),
+    Fault(
+        "shutdown: a gateway shutting down still says it is ready",
+        "a_gateway_is_ready_until_it_starts_shutting_down",
+        GATEWAY,
+        [("        if self.is_draining() {\n            return Err(\"shutting down\".to_owned());", "        if self.is_draining() && false {\n            return Err(\"shutting down\".to_owned());")],
+    ),
+    Fault(
+        "health: readiness ignores the database",
+        "a_gateway_that_cannot_reach_its_log_is_not_ready",
+        STORE,
+        [("        sqlx::query(\"SELECT 1\").execute(&self.pool).await?;", "")],
+    ),
+    Fault(
+        "lookup: the gateway reads the whole session for every call",
+        "the_thousandth_call_reads_no_more_than_the_hundredth",
+        GATEWAY,
+        [("            .call_lookup(session, &key)", "            .session_events({ let _ = &key; session })")],
+    ),
+    Fault(
+        "lookup: a step finds the newest request, not the oldest",
+        "a_call_lookup_finds_what_the_whole_log_would",
+        STORE,
+        [("    ORDER BY seq LIMIT 1\";", "    ORDER BY seq DESC LIMIT 1\";")],
+    ),
+    Fault(
+        "lookup: the call's answers are left out",
+        "a_call_lookup_finds_what_the_whole_log_would",
+        STORE,
+        [("    WHERE session_id = $1 AND request_seq = $3 AND kind = 'call_response'", "    WHERE session_id = $1 AND request_seq = $3 AND kind = 'call_response' AND false")],
+    ),
+    Fault(
+        "lookup: an id loses its JSON quotes, so 5 and \"5\" collide",
+        "a_call_lookup_finds_what_the_whole_log_would",
+        STORE,
+        [("            rpc_id: event.payload.get(\"rpc_id\").map(Value::to_string),", "            rpc_id: event.payload.get(\"rpc_id\").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())),")],
+    ),
+    Fault(
+        "lookup: the step index does not match its query",
+        "each_lookup_query_has_an_index_that_matches_it",
+        CALL_LOOKUP,
+        [("    ON events (session_id, ask_step, seq)", "    ON events (session_id, seq)")],
+    ),
+    Fault(
+        "lookup: the migration leaves old requests without keys",
+        "the_lookup_migration_fills_in_requests_logged_before_it",
+        CALL_LOOKUP,
+        [("  AND position('\\u0000' IN payload::text) = 0;", "  AND position('\\u0000' IN payload::text) = 0 AND false;")],
+    ),
+    Fault(
+        "conformance: the memory store's lookup ignores the transport",
+        "a_call_lookup_finds_what_the_whole_log_would",
+        LOOKUP,
+        [("            e.payload[\"transport\"].as_str() == Some(transport.as_str())", "            (e.payload[\"transport\"].as_str() == Some(transport.as_str()) || true)")],
+    ),
 ]
 
 
@@ -803,7 +960,9 @@ def copy_source(copy: Path) -> None:
         source = ROOT / name
         if source.is_file():
             (copy / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, copy / name)
+            # Not copy2: the copy must be newer than anything an earlier run built in the
+            # shared target directory, or cargo would reuse that run's last faulty build.
+            shutil.copy(source, copy / name)
 
 
 def stale_edits() -> list[str]:

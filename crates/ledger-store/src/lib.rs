@@ -2,6 +2,7 @@
 
 mod event;
 mod fork;
+mod lookup;
 mod memory;
 mod postgres;
 
@@ -11,6 +12,7 @@ use async_trait::async_trait;
 
 pub use event::{Event, EventKind, NewEvent, Outcome, SessionSummary, args_hash};
 pub use fork::{Fork, ToolMode};
+pub use lookup::{CallKey, lookup_in};
 pub use memory::MemoryStore;
 pub use postgres::{MIGRATOR, PgEventStore};
 
@@ -70,6 +72,11 @@ pub trait EventStore: Send + Sync + 'static {
     /// All events of a session, ordered by sequence.
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError>;
 
+    /// The few events that decide whether a call repeats an earlier one, exactly as
+    /// [`lookup_in`] finds them in the whole log, but without reading it, so a call costs
+    /// the same however long its session has run.
+    async fn call_lookup(&self, session_id: &str, key: &CallKey) -> Result<Vec<Event>, StoreError>;
+
     /// All sessions, most recently created first.
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError>;
 
@@ -83,4 +90,9 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// The fork a session is, if it is one.
     async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError>;
+
+    /// Whether the store answers at all, for readiness checks.
+    async fn healthy(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }

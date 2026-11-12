@@ -1,0 +1,6 @@
+.*
+*.md
+target
+var
+vscode
+interop/typescript/node_modules

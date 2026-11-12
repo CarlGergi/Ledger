@@ -5,8 +5,14 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ledger_gateway::regress::{self, Suite};
-use ledger_gateway::{Config, Gateway, McpUpstream, ModelUpstream, Upstream};
+use ledger_gateway::{
+    Config, Gateway, McpUpstream, ModelUpstream, Telemetry, TelemetryConfig, Upstream,
+};
 use ledger_store::{Event, EventKind, EventStore, Fork, PgEventStore, ToolMode};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -328,6 +334,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let mut gateway =
         Gateway::with_policy(Arc::new(store), upstreams, config.call_timeout(), policy)
             .with_lease_ttl(config.lease_ttl());
+    let providers = telemetry_providers(config.telemetry.as_ref())?;
+    if let Some((traces, metrics)) = &providers {
+        gateway = gateway.with_telemetry(Telemetry::new(traces, metrics));
+    }
     if let Some(model) = &config.model {
         gateway = gateway.with_model(ModelUpstream::new(
             &model.url,
@@ -336,11 +346,30 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         ));
     }
 
+    // Ctrl-C, or SIGTERM as container platforms send: stop being ready and turn new calls
+    // away, but keep serving until calls already running have logged their answers, so
+    // that health checks get a clear answer meanwhile. Then stop.
+    let grace = config.shutdown_grace();
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
+        let gateway = gateway.clone();
         async move {
-            let _ = tokio::signal::ctrl_c().await;
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            tracing::info!("shutting down");
+            gateway.begin_shutdown();
+            if !gateway.drain(grace).await {
+                tracing::warn!(
+                    calls = gateway.active_calls(),
+                    "calls still running after {grace:?}; their answers will not be logged"
+                );
+            }
             shutdown.cancel();
         }
     });
@@ -354,7 +383,53 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("model proxy on http://{address}/v1/chat/completions");
     }
     ledger_gateway::serve(gateway, listener, config.allowed_hosts, shutdown).await?;
+    if let Some((traces, metrics)) = providers {
+        // Sends what is still buffered. Blocking, so off the async threads.
+        tokio::task::spawn_blocking(move || {
+            for result in [traces.shutdown(), metrics.shutdown()] {
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "could not flush telemetry");
+                }
+            }
+        })
+        .await?;
+    }
     Ok(())
+}
+
+/// OTLP/HTTP exporters for traces and metrics: to the configured collector, or where
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` says if nothing is configured, or none if neither is.
+fn telemetry_providers(
+    config: Option<&TelemetryConfig>,
+) -> anyhow::Result<Option<(SdkTracerProvider, SdkMeterProvider)>> {
+    let from_env = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some();
+    if config.is_none() && !from_env {
+        return Ok(None);
+    }
+    let service = config
+        .map_or("ledger", |c| c.service_name.as_str())
+        .to_owned();
+    let resource = Resource::builder().with_service_name(service).build();
+    let mut spans = SpanExporter::builder().with_http();
+    let mut metrics = MetricExporter::builder().with_http();
+    if let Some(config) = config {
+        let base = config.otlp_endpoint.trim_end_matches('/');
+        spans = spans.with_endpoint(format!("{base}/v1/traces"));
+        metrics = metrics.with_endpoint(format!("{base}/v1/metrics"));
+    }
+    let interval = config.map_or(60, |c| c.metrics_interval_secs);
+    let reader = PeriodicReader::builder(metrics.build()?)
+        .with_interval(Duration::from_secs(interval))
+        .build();
+    let traces = SdkTracerProvider::builder()
+        .with_batch_exporter(spans.build()?)
+        .with_resource(resource.clone())
+        .build();
+    let metrics = SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(resource)
+        .build();
+    Ok(Some((traces, metrics)))
 }
 
 fn print_report(report: &ledger_gateway::compare::Report) {

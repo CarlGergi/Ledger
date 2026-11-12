@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ledger_store::{
-    Event, EventKind, EventStore, Fork, Lease, MemoryStore, NewEvent, Outcome, PgEventStore,
-    StoreError, ToolMode, args_hash,
+    CallKey, Event, EventKind, EventStore, Fork, Lease, MemoryStore, NewEvent, Outcome,
+    PgEventStore, StoreError, ToolMode, args_hash, lookup_in,
 };
 use serde_json::json;
 
@@ -72,6 +72,7 @@ conformance!(
     the_schema_refuses_malformed_model_calls,
     a_fork_claims_a_new_session_and_names_its_source,
     a_fork_cannot_take_a_started_session_or_name_a_missing_source,
+    a_call_lookup_finds_what_the_whole_log_would,
 );
 
 async fn sequences_start_at_one_and_have_no_gaps(store: Arc<dyn EventStore>) {
@@ -624,4 +625,97 @@ async fn a_fork_cannot_take_a_started_session_or_name_a_missing_source(store: Ar
     assert_eq!(names, ["busy", "f", "src"]);
     assert_eq!(store.fork("busy").await.unwrap(), None);
     assert_eq!(store.session_events("busy").await.unwrap().len(), 1);
+}
+
+async fn a_call_lookup_finds_what_the_whole_log_would(store: Arc<dyn EventStore>) {
+    let lease = store.acquire_lease("s", "a", HOUR).await.unwrap();
+    let append = |event: NewEvent| {
+        let store = store.clone();
+        let lease = lease.clone();
+        async move { store.append(event, &lease).await.unwrap().seq }
+    };
+    let ask = |tool: &str, step: Option<&str>, rpc_id: serde_json::Value, transport: &str| {
+        let payload = json!({ "step": step, "rpc_id": rpc_id, "transport": transport });
+        NewEvent::request("s", tool, &json!({ "tool": tool }), payload)
+    };
+    let answer = |seq: i64, outcome| NewEvent::response("s", seq, "t", outcome, json!({}));
+    let retry = |seq: i64, step: Option<&str>, rpc_id: serde_json::Value, transport: &str| {
+        let payload = json!({ "step": step, "rpc_id": rpc_id, "transport": transport });
+        NewEvent::retry("s", seq, "t", payload)
+    };
+
+    let a = append(ask("t", Some("1"), json!(1), "t1")).await; // 1
+    append(answer(a, Outcome::Timeout)).await; // 2
+    append(retry(a, Some("1"), json!(2), "t1")).await; // 3
+    append(answer(a, Outcome::Ok)).await; // 4
+    let body = json!({ "model": "m" });
+    let m = append(NewEvent::model_request(
+        "s",
+        "m",
+        &body,
+        json!({ "step": "1" }),
+    ))
+    .await; // 5
+    append(NewEvent::model_response(
+        "s",
+        m,
+        "m",
+        Outcome::Ok,
+        json!({}),
+    ))
+    .await; // 6
+    let b = append(ask("u", None, json!(5), "t1")).await; // 7
+    let c = append(ask("v", None, json!("5"), "t1")).await; // 8
+    let d = append(ask("w", None, json!(5), "t2")).await; // 9
+    append(answer(d, Outcome::Ok)).await; // 10
+    let r = append(retry(b, None, json!(7), "t1")).await; // 11
+    append(answer(b, Outcome::Ok)).await; // 12
+    let e = append(ask("x", Some("1"), json!(9), "t1")).await; // 13: step 1 reused
+    append(answer(e, Outcome::Refused)).await; // 14
+    let f = append(ask("y", None, json!(5), "t1")).await; // 15: id 5 again on t1
+    // Another session's events must never be returned.
+    let other = store.acquire_lease("o", "a", HOUR).await.unwrap();
+    let noise = NewEvent::request(
+        "o",
+        "t",
+        &json!({}),
+        json!({ "step": "1", "rpc_id": 5, "transport": "t1" }),
+    );
+    store.append(noise, &other).await.unwrap();
+
+    let key = |step: Option<&str>, rpc_id: serde_json::Value, transport: Option<&str>| CallKey {
+        step: step.map(str::to_owned),
+        rpc_id,
+        transport: transport.map(str::to_owned),
+    };
+    let all = store.session_events("s").await.unwrap();
+    for (key, expected) in [
+        // The oldest ask naming step 1 is the first request: it and its answers.
+        (key(Some("1"), json!(0), None), vec![a, 2, 4]),
+        // A step wins over the id, even when the id matches something else.
+        (key(Some("1"), json!(5), Some("t1")), vec![a, 2, 4]),
+        (key(Some("9"), json!(5), Some("t1")), vec![]),
+        // The newest ask with id 5 on t1 is the last request, not the first.
+        (key(None, json!(5), Some("t1")), vec![f]),
+        // "5" is a different id from 5.
+        (key(None, json!("5"), Some("t1")), vec![c]),
+        (key(None, json!(5), Some("t2")), vec![d, 10]),
+        // A retry found by its id brings its call and the call's answers.
+        (key(None, json!(7), Some("t1")), vec![b, r, 12]),
+        (key(None, json!(2), Some("t1")), vec![a, 2, 3, 4]),
+        (key(None, json!(5), None), vec![]),
+        (key(None, json!(5), Some("t9")), vec![]),
+    ] {
+        let found = store.call_lookup("s", &key).await.unwrap();
+        let seqs: Vec<i64> = found.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, expected, "{key:?}");
+        assert_eq!(found, lookup_in(&all, &key), "{key:?}");
+    }
+    assert!(
+        store
+            .call_lookup("missing", &key(Some("1"), json!(1), Some("t1")))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

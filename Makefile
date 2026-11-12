@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local bench-duplicates bench-overhead stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -12,8 +12,11 @@ help:
 	@echo "make vscode     type-check and test the VS Code extension"
 	@echo "make vscode-package  build vscode/out/ledger.vsix to install"
 	@echo "make regress    replay three recorded runs on each scripted model and report changes"
+	@echo "make bench-duplicates  count duplicate side effects with and without Ledger"
+	@echo "make bench-overhead    latency and throughput Ledger adds; only on a quiet machine"
 	@echo "make soak       repeat the test suite under load, about 30 minutes; not part of reproduce"
 	@echo "make demo       run the sample agent and print its log"
+	@echo "make demo-agentmail  one email, a lost answer, a retry: sent twice, then once with Ledger"
 	@echo "make stack      run the gateway and tool servers until interrupted"
 	@echo "make sessions   list recorded sessions"
 	@echo "make log SESSION=<id>  print a session's events"
@@ -70,6 +73,22 @@ demo-model: db-up
 	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
 		target/debug/sample-agent --session $$session --model reporter-1 >/dev/null && target/debug/ledger log $$session'
 
+demo-agentmail: db-up
+	scripts/agentmail-demo.sh
+
+# The same, always against the local stand-in for AgentMail, so it sends no real email.
+agentmail-local: db-up
+	scripts/agentmail-demo.sh --local
+
+bench-duplicates: db-up
+	for loss in 0.1 0.3; do \
+		cargo run --quiet --release -p ledger-bench --bin duplicates -- --calls 1000 --loss $$loss --seed 1 || exit 1; \
+		echo; done
+
+# Timings mislead on a busy machine; the binary refuses to measure without the flag.
+bench-overhead: db-up
+	cargo run --quiet --release -p ledger-bench --bin overhead -- --machine-is-quiet
+
 stack: db-up
 	scripts/with-stack.sh sh -c 'echo "gateway on http://127.0.0.1:7100/mcp; Ctrl-C to stop"; while :; do sleep 3600; done'
 
@@ -79,7 +98,7 @@ sessions:
 log:
 	cargo run --quiet --package ledger-gateway --bin ledger -- log $(SESSION)
 
-reproduce: lint test breakage simulate interop regress vscode
+reproduce: lint test breakage simulate interop regress agentmail-local bench-duplicates vscode
 
 clean:
 	cargo clean

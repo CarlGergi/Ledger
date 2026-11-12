@@ -1,0 +1,31 @@
+[package]
+name = "ledger-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "duplicates"
+path = "src/duplicates.rs"
+
+[[bin]]
+name = "overhead"
+path = "src/overhead.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ledger-gateway.workspace = true
+ledger-store.workspace = true
+ledger-testkit.workspace = true
+ledger-tools.workspace = true
+sample-agent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

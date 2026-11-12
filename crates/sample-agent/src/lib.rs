@@ -170,3 +170,133 @@ pub async fn run_model_agent(
     }
     anyhow::bail!("the model did not finish within {MAX_TURNS} turns")
 }
+
+/// How a retrying agent's email went.
+#[derive(Debug, Clone)]
+pub struct Delivery {
+    /// Attempts made, the last one included.
+    pub attempts: usize,
+    /// The tool's answer to the last attempt, or why it failed.
+    pub result: Result<CallToolResult, String>,
+}
+
+/// Sends one email the way many agents do: call the tool, and if no answer comes back, connect
+/// again and send it again, up to `attempts` times. Every attempt names `step`, which is how a
+/// gateway like Ledger can tell a resend from a new email; a tool server on its own cannot.
+pub async fn send_until_answered(
+    url: &str,
+    session: Option<&str>,
+    step: &str,
+    tool: &str,
+    arguments: Value,
+    attempts: usize,
+) -> Delivery {
+    let mut last = Err("no attempt was made".to_owned());
+    for attempt in 1..=attempts {
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderName::from_static("x-ledger-step"),
+            HeaderValue::from_str(step).expect("a valid step"),
+        );
+        if let Some(session) = session {
+            headers.insert(
+                HeaderName::from_static("x-ledger-session"),
+                HeaderValue::from_str(session).expect("a valid session"),
+            );
+        }
+        let config =
+            StreamableHttpClientTransportConfig::with_uri(url.to_owned()).custom_headers(headers);
+        let connected = ClientConfig::default()
+            .serve(StreamableHttpClientTransport::from_config(config))
+            .await;
+        let client = match connected {
+            Ok(client) => client,
+            Err(e) => {
+                last = Err(format!("connecting: {e}"));
+                continue;
+            }
+        };
+        last = client
+            .call_tool(call_params(tool, arguments.clone()))
+            .await
+            .map_err(|e| e.to_string());
+        let _ = client.cancel().await;
+        if last.is_ok() {
+            return Delivery {
+                attempts: attempt,
+                result: last,
+            };
+        }
+    }
+    Delivery {
+        attempts,
+        result: last,
+    }
+}
+
+/// An agent that keeps one connection and retries a call until it is answered, reconnecting
+/// only after a failure, as a long-running agent would. Each call names its step in its own
+/// `_meta`, so one connection can carry many calls and a gateway can still tell a resend from
+/// a new call.
+pub struct RetryingAgent {
+    url: String,
+    session: Option<String>,
+    client: Option<Client>,
+}
+
+impl RetryingAgent {
+    pub fn new(url: &str, session: Option<&str>) -> Self {
+        Self {
+            url: url.to_owned(),
+            session: session.map(str::to_owned),
+            client: None,
+        }
+    }
+
+    pub async fn call(
+        &mut self,
+        step: &str,
+        tool: &str,
+        arguments: Value,
+        attempts: usize,
+    ) -> Delivery {
+        let mut last = Err("no attempt was made".to_owned());
+        for attempt in 1..=attempts {
+            if self.client.is_none() {
+                match connect(&self.url, self.session.as_deref()).await {
+                    Ok(client) => self.client = Some(client),
+                    Err(e) => {
+                        last = Err(format!("connecting: {e:#}"));
+                        continue;
+                    }
+                }
+            }
+            let client = self.client.as_ref().expect("connected above");
+            let mut meta = Map::new();
+            meta.insert("ledger/step".to_owned(), Value::String(step.to_owned()));
+            let mut params = call_params(tool, arguments.clone());
+            params.meta = Some(meta.into());
+            last = client.call_tool(params).await.map_err(|e| e.to_string());
+            if last.is_ok() {
+                return Delivery {
+                    attempts: attempt,
+                    result: last,
+                };
+            }
+            // The connection may be broken: start a new one for the next attempt.
+            if let Some(client) = self.client.take() {
+                let _ = client.cancel().await;
+            }
+        }
+        Delivery {
+            attempts,
+            result: last,
+        }
+    }
+
+    pub async fn close(mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = client.cancel().await;
+        }
+    }
+}

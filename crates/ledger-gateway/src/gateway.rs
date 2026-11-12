@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use ledger_store::{
-    Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, StoreError, args_hash,
+    CallKey, Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, StoreError, args_hash,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverRequestMethod,
@@ -23,6 +23,7 @@ use crate::fork::{self, Asked, Replay};
 use crate::model::{self, ModelUpstream};
 use crate::policy::{DEFAULT_KEY_PARAM, Effect, EffectClass, EffectPolicy};
 use crate::session::{resolve_session, resolve_step};
+use crate::telemetry::{CallKind, CallSpan, Telemetry};
 use crate::upstream::{Upstream, UpstreamError};
 
 /// Agents see each tool as `<upstream>__<tool>`, which keeps names from different
@@ -77,6 +78,21 @@ struct Inner {
     /// Which sessions are forks. A session that has recorded anything can never become
     /// one, so once it has, the answer is kept either way.
     forks: Mutex<HashMap<String, Option<Fork>>>,
+    telemetry: Telemetry,
+    /// Calls being handled, model calls included. Each runs detached from its caller, so
+    /// shutting down waits for this to reach zero rather than for connections to close.
+    active: watch::Sender<usize>,
+    /// Set once shutdown has begun, so that readiness checks send traffic elsewhere.
+    draining: std::sync::atomic::AtomicBool,
+}
+
+/// Counts a call as active for as long as it lives.
+struct Active(watch::Sender<usize>);
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
 }
 
 /// One `tools/call` as it arrived: what the gateway knows about a call besides the call.
@@ -88,6 +104,8 @@ pub struct Arrival {
     pub transport: Option<String>,
     pub step: Option<String>,
     pub params: CallToolRequestParams,
+    /// The agent's W3C `traceparent`, so the call's span joins the agent's trace.
+    pub traceparent: Option<String>,
 }
 
 /// What to do about a call, decided under its session's lock.
@@ -107,6 +125,8 @@ pub struct ModelCall {
     pub body: Value,
     /// The agent's credentials for the model, used only if the gateway has none.
     pub credentials: http::HeaderMap,
+    /// The agent's W3C `traceparent`, so the call's span joins the agent's trace.
+    pub traceparent: Option<String>,
 }
 
 /// A model call's failure, for the agent: the HTTP status and an OpenAI-style error body.
@@ -162,6 +182,9 @@ impl Gateway {
                 session_locks: Mutex::default(),
                 in_flight: Mutex::default(),
                 forks: Mutex::default(),
+                telemetry: Telemetry::none(),
+                active: watch::Sender::new(0),
+                draining: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -180,10 +203,71 @@ impl Gateway {
     /// the caller going away cannot stop its outcome reaching the log. For driving copies
     /// without HTTP, as the simulator does.
     pub async fn call(&self, arrival: Arrival) -> Answer {
+        if self.is_draining() {
+            return Err(ErrorData::new(
+                error_codes::NOT_RECORDED,
+                "ledger is shutting down, so this call was neither recorded nor forwarded",
+                None,
+            ));
+        }
         let gateway = self.clone();
-        tokio::spawn(async move { gateway.handle(arrival).await.1 })
+        let active = self.begin();
+        tokio::spawn(async move {
+            let answer = gateway.handle(arrival).await.1;
+            drop(active);
+            answer
+        })
+        .await
+        .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+    }
+
+    fn begin(&self) -> Active {
+        self.inner.active.send_modify(|n| *n += 1);
+        Active(self.inner.active.clone())
+    }
+
+    /// How many calls are being handled right now.
+    pub fn active_calls(&self) -> usize {
+        *self.inner.active.borrow()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.inner
+            .draining
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Starts shutting down: from now on the gateway reports itself not ready and turns new
+    /// calls away, while calls already running carry on.
+    pub fn begin_shutdown(&self) {
+        let draining = &self.inner.draining;
+        draining.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether it should get new traffic: not shutting down, and its log answering.
+    pub async fn ready(&self) -> Result<(), String> {
+        if self.is_draining() {
+            return Err("shutting down".to_owned());
+        }
+        self.inner.store.healthy().await.map_err(|e| e.to_string())
+    }
+
+    /// Waits until every call being handled has its answer logged, for at most `within`.
+    /// Returns whether they all finished.
+    pub async fn drain(&self, within: Duration) -> bool {
+        let mut active = self.inner.active.subscribe();
+        tokio::time::timeout(within, active.wait_for(|n| *n == 0))
             .await
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+            .is_ok()
+    }
+
+    /// Reports traces and metrics through `telemetry`. Call it before serving.
+    pub fn with_telemetry(self, telemetry: Telemetry) -> Self {
+        let mut inner = Arc::into_inner(self.inner).expect("configure the gateway before use");
+        inner.telemetry = telemetry;
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Proxies model calls to `model`. Call it before serving.
@@ -198,20 +282,75 @@ impl Gateway {
     /// Handles a model call, detached from the caller like [`Gateway::call`]: logs the
     /// request, forwards it once, logs the reply, and returns the reply as logged.
     pub async fn model_call(&self, call: ModelCall) -> ModelAnswer {
+        if self.is_draining() {
+            return Err(model_failure(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::NOT_RECORDED,
+                "not_recorded",
+                "ledger is shutting down, so this call was neither recorded nor sent",
+            ));
+        }
         let gateway = self.clone();
-        tokio::spawn(async move { gateway.handle_model(call).await })
-            .await
-            .unwrap_or_else(|e| {
-                Err(model_failure(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorCode::INTERNAL_ERROR,
-                    "internal_error",
-                    &e.to_string(),
-                ))
-            })
+        let active = self.begin();
+        tokio::spawn(async move {
+            let answer = gateway.handle_model(call).await;
+            drop(active);
+            answer
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(model_failure(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::INTERNAL_ERROR,
+                "internal_error",
+                &e.to_string(),
+            ))
+        })
     }
 
     async fn handle_model(&self, call: ModelCall) -> ModelAnswer {
+        let telemetry = &self.inner.telemetry;
+        let name = call.body["model"].as_str().unwrap_or_default();
+        let parent = call.traceparent.as_deref();
+        let mut span = telemetry.start_call(CallKind::Model, name, &call.session, parent);
+        let answer = self.model_call_spanned(call, &mut span).await;
+        let outcome = match &answer {
+            Ok(logged) => {
+                if let Some(status) = logged["status"].as_i64() {
+                    span.set("http.response.status_code", status);
+                }
+                let body = &logged["body"]["json"];
+                if let Some(model) = body["model"].as_str() {
+                    span.set("gen_ai.response.model", model.to_owned());
+                }
+                for (key, field) in [
+                    ("gen_ai.usage.input_tokens", "prompt_tokens"),
+                    ("gen_ai.usage.output_tokens", "completion_tokens"),
+                ] {
+                    if let Some(tokens) = body["usage"][field].as_i64() {
+                        span.set(key, tokens);
+                    }
+                }
+                match logged["status"].as_u64() {
+                    Some(200..=299) => "ok",
+                    _ => "http_error",
+                }
+            }
+            Err(failure) => match failure.body["error"]["type"].as_str() {
+                Some("not_recorded") => "not_recorded",
+                Some("outcome_not_recorded") => "outcome_not_recorded",
+                Some("transport_error") => "transport_error",
+                Some("timeout") => "timeout",
+                Some("fork_diverged") => "fork_diverged",
+                Some("not_configured") => "not_configured",
+                _ => "error",
+            },
+        };
+        span.finish(telemetry, outcome);
+        answer
+    }
+
+    async fn model_call_spanned(&self, call: ModelCall, span: &mut CallSpan) -> ModelAnswer {
         let Some(upstream) = &self.inner.model else {
             return Err(model_failure(
                 http::StatusCode::NOT_FOUND,
@@ -244,7 +383,14 @@ impl Gateway {
         };
         if let Some(fork) = &fork {
             match self.replay_model(fork, &call.body, &name).await {
-                Ok(ModelPlan::Answered(answer)) => return answer,
+                Ok(ModelPlan::Answered(answer)) => {
+                    span.decided(if answer.is_ok() {
+                        "replayed"
+                    } else {
+                        "fork_diverged"
+                    });
+                    return answer;
+                }
                 Ok(ModelPlan::Live) => {
                     if let Some(model) = &fork.model {
                         sent["model"] = json!(model);
@@ -263,10 +409,12 @@ impl Gateway {
         let request = NewEvent::model_request(session, &name, &call.body, payload);
         let seq = self.append(request).await.map_err(not_recorded)?.seq;
         drop(guard);
+        span.set("ledger.seq", seq);
 
         let heartbeat = self.heartbeat(session).await;
-        let sent =
-            tokio::time::timeout(upstream.timeout(), upstream.send(&sent, &call.credentials)).await;
+        let traceparent = span.traceparent();
+        let sending = upstream.send(&sent, &call.credentials, traceparent.as_deref());
+        let sent = tokio::time::timeout(upstream.timeout(), sending).await;
         drop(heartbeat);
 
         let (outcome, logged, failure) = match sent {
@@ -386,7 +534,10 @@ impl Gateway {
         let session = event.session_id.clone();
         let appended = self.inner.store.append(event, &lease).await;
         match &appended {
-            Err(StoreError::Fenced) => self.forget_lease(&lease).await,
+            Err(StoreError::Fenced) => {
+                self.inner.telemetry.fenced();
+                self.forget_lease(&lease).await;
+            }
             // It has recorded something now, so if it is not a fork it never will be.
             Ok(_) => {
                 let mut forks = self.inner.forks.lock().expect("lock poisoned");
@@ -434,6 +585,7 @@ impl Gateway {
             .store
             .acquire_lease(session, &self.inner.owner, self.inner.lease_ttl)
             .await?;
+        self.inner.telemetry.lease_taken(lease.token);
         self.flag_open_calls(&lease).await?;
         leases.insert(session.to_owned(), lease.clone());
         Ok(lease)
@@ -460,12 +612,15 @@ impl Gateway {
                 json!({ "reason": "open when this copy took the session over" }),
             );
             match store.append(flag, lease).await {
-                Ok(_) => tracing::warn!(
-                    session = lease.session_id,
-                    seq = request.seq,
-                    tool = request.tool,
-                    "flagged a call as in doubt"
-                ),
+                Ok(_) => {
+                    self.inner.telemetry.flagged_in_doubt("takeover");
+                    tracing::warn!(
+                        session = lease.session_id,
+                        seq = request.seq,
+                        tool = request.tool,
+                        "flagged a call as in doubt"
+                    );
+                }
                 Err(StoreError::Fenced) => return Err(StoreError::Fenced),
                 // Most likely answered meanwhile by the copy that forwarded it.
                 Err(e) => tracing::warn!(seq = request.seq, error = %e, "could not flag call"),
@@ -483,11 +638,29 @@ impl Gateway {
     /// reaches the agent that the log does not also hold. Everything the agent saw can
     /// therefore be replayed from the log. Returns the call the answer belongs to.
     async fn handle(&self, arrival: Arrival) -> (Option<i64>, Answer) {
+        let telemetry = &self.inner.telemetry;
         let tool = arrival.params.name.to_string();
-        let effect = self.effect_of(&tool).await;
+        let parent = arrival.traceparent.as_deref();
+        let mut span = telemetry.start_call(CallKind::Tool, &tool, &arrival.session, parent);
+        let (seq, answer) = self.handle_spanned(&arrival, &tool, &mut span).await;
+        if let Some(seq) = seq {
+            span.set("ledger.seq", seq);
+        }
+        span.finish(telemetry, outcome_of(&answer));
+        (seq, answer)
+    }
+
+    async fn handle_spanned(
+        &self,
+        arrival: &Arrival,
+        tool: &str,
+        span: &mut CallSpan,
+    ) -> (Option<i64>, Answer) {
+        let effect = self.effect_of(tool).await;
+        span.set("ledger.effect.class", effect.class.as_str());
         let lock = self.session_lock(&arrival.session);
         let guard = lock.lock().await;
-        let planned = self.plan(&arrival, &tool, &effect).await;
+        let planned = self.plan(arrival, tool, &effect, span).await;
         drop(guard);
         let (seq, plan) = match planned {
             Ok(planned) => planned,
@@ -501,7 +674,8 @@ impl Gateway {
                 Err(_) => Err(ErrorData::internal_error("the call was abandoned", None)),
             },
             Plan::Forward { key, done } => {
-                let answer = self.run(&arrival, &tool, seq, key).await;
+                span.event("forwarded");
+                let answer = self.run(arrival, tool, seq, key).await;
                 let id = (arrival.session.clone(), seq);
                 self.inner
                     .in_flight
@@ -521,6 +695,7 @@ impl Gateway {
         arrival: &Arrival,
         tool: &str,
         effect: &Effect,
+        span: &mut CallSpan,
     ) -> Result<(i64, Plan), ErrorData> {
         let session = arrival.session.as_str();
         let not_recorded = |e: StoreError| {
@@ -532,10 +707,17 @@ impl Gateway {
             )
         };
         self.lease(session).await.map_err(not_recorded)?;
+        // Only what decides whether this call repeats an earlier one, not the whole log, so a
+        // call costs the same however long its session has run.
+        let key = CallKey {
+            step: arrival.step.clone(),
+            rpc_id: arrival.rpc_id.clone(),
+            transport: arrival.transport.clone(),
+        };
         let events = self
             .inner
             .store
-            .session_events(session)
+            .call_lookup(session, &key)
             .await
             .map_err(not_recorded)?;
 
@@ -569,17 +751,26 @@ impl Gateway {
                         args_hash: &hash,
                         read_only: effect.class == EffectClass::ReadOnly,
                     };
-                    let answered = self
-                        .replay_tool(&fork, &events, &asked, &arguments, payload.clone())
+                    // A fork matches against everything it has done so far.
+                    let own = self
+                        .inner
+                        .store
+                        .session_events(session)
                         .await
                         .map_err(not_recorded)?;
-                    if let Some(answered) = answered {
+                    let answered = self
+                        .replay_tool(&fork, &own, &asked, &arguments, payload.clone())
+                        .await
+                        .map_err(not_recorded)?;
+                    if let Some((decision, answered)) = answered {
+                        span.decided(decision);
                         return Ok(answered);
                     }
                 }
                 let request = NewEvent::request(session, tool, &arguments, payload);
                 let seq = self.append(request).await.map_err(not_recorded)?.seq;
                 if let Decision::StepReused(earlier) = decision {
+                    span.decided("step_reused");
                     let reason = format!(
                         "step {} already named call #{earlier}, which had different arguments",
                         arrival.step.as_deref().unwrap_or_default()
@@ -609,13 +800,19 @@ impl Gateway {
                     .get(&id)
                     .cloned();
                 if let Some(done) = running {
+                    span.decided("retry_waited");
                     return Ok((seq, Plan::Wait(done)));
                 }
                 if let Some(answer) = dedup::final_answer(&events, seq) {
+                    span.decided("retry_from_log");
                     return Ok((seq, Plan::Answer(from_log(answer, session))));
                 }
                 let request = dedup::request(&events, seq).expect("decided from this log");
                 let plan = self.settle_in_doubt(request).await.map_err(not_recorded)?;
+                span.decided(match plan {
+                    Plan::Forward { .. } => "retry_rerun",
+                    _ => "retry_in_doubt",
+                });
                 Ok((seq, plan))
             }
         }
@@ -630,7 +827,7 @@ impl Gateway {
         asked: &Asked<'_>,
         arguments: &Value,
         mut payload: Value,
-    ) -> Result<Option<(i64, Plan)>, StoreError> {
+    ) -> Result<Option<(&'static str, (i64, Plan))>, StoreError> {
         let session = fork.session_id.as_str();
         let tool = asked.name;
         let source = self
@@ -638,6 +835,12 @@ impl Gateway {
             .store
             .session_events(&fork.source_session)
             .await?;
+        let decision = match fork::decide(fork, &source, own, asked) {
+            Replay::Live => return Ok(None),
+            Replay::Source { .. } => "replayed",
+            Replay::Refuse(_) => "fork_refused",
+            Replay::Diverged(_) => "fork_diverged",
+        };
         let (outcome, logged, failure) = match fork::decide(fork, &source, own, asked) {
             Replay::Live => return Ok(None),
             Replay::Source { request, answer } => {
@@ -665,7 +868,7 @@ impl Gateway {
             Some(error) => Err(error),
             None => from_log(&answer, session),
         };
-        Ok(Some((seq, Plan::Answer(answer))))
+        Ok(Some((decision, (seq, Plan::Answer(answer)))))
     }
 
     /// A retry of a call that has no final answer and is not running here: it may or may
@@ -695,6 +898,7 @@ impl Gateway {
                     json!({ "reason": reason }),
                 );
                 self.append(flag).await?;
+                self.inner.telemetry.flagged_in_doubt("retry");
                 let error = in_doubt_error(&request.tool, session, request.seq);
                 Ok(Plan::Answer(Err(error)))
             }
@@ -905,6 +1109,30 @@ fn set_system_prompt(body: &mut Value, prompt: &str) {
     }
 }
 
+/// What the agent got, as a span's and a metric's outcome.
+fn outcome_of(answer: &Answer) -> &'static str {
+    match answer {
+        Ok(response) => {
+            let result = serde_json::to_value(ServerResult::from(response.clone()));
+            match result {
+                Ok(result) if result["isError"] == json!(true) => "tool_error",
+                _ => "ok",
+            }
+        }
+        Err(error) if error.code == error_codes::NOT_RECORDED => "not_recorded",
+        Err(error) if error.code == error_codes::OUTCOME_NOT_RECORDED => "outcome_not_recorded",
+        Err(error) if error.code == error_codes::FORK_DIVERGED => "fork_diverged",
+        Err(error) if error.code == error_codes::OUTCOME_UNKNOWN => {
+            match error.data.as_ref().map(|d| &d["in_doubt"]) {
+                Some(Value::Bool(true)) => "in_doubt",
+                _ => "outcome_unknown",
+            }
+        }
+        Err(error) if error.code == ErrorCode::INVALID_PARAMS => "invalid_params",
+        Err(_) => "rpc_error",
+    }
+}
+
 fn model_failure(
     status: http::StatusCode,
     code: ErrorCode,
@@ -1054,6 +1282,12 @@ impl ServerHandler for Gateway {
                 .map(str::to_owned),
             step: resolve_step(parts, &json!(context.meta))?,
             params: request,
+            traceparent: parts
+                .headers
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| context.meta.get("traceparent").and_then(|v| v.as_str()))
+                .map(str::to_owned),
         };
 
         self.call(arrival).await

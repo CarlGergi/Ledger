@@ -18,6 +18,9 @@ clap.workspace = true
 futures.workspace = true
 http.workspace = true
 ledger-store.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
 serde.workspace = true
@@ -31,6 +34,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 chrono.workspace = true
 ledger-testkit.workspace = true
 ledger-tools.workspace = true

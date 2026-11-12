@@ -30,6 +30,17 @@ pub enum EffectClass {
     AtMostOnce,
 }
 
+impl EffectClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Idempotent => "idempotent",
+            Self::Keyed => "keyed",
+            Self::AtMostOnce => "at_most_once",
+        }
+    }
+}
+
 /// Where a tool's class came from, recorded so that a decision can be explained later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +195,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_class_names_itself_as_the_log_does() {
+        use EffectClass::*;
+        for class in [ReadOnly, Idempotent, Keyed, AtMostOnce] {
+            assert_eq!(json!(class), class.as_str());
+        }
+    }
 
     fn tool(properties: Value) -> Tool {
         let schema = json!({"type": "object", "properties": properties});

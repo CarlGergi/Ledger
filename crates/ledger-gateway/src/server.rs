@@ -5,7 +5,7 @@ use axum::Router;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use rmcp::model::ErrorCode;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -27,7 +27,8 @@ struct ModelRoutes {
     allowed_hosts: Arc<Vec<String>>,
 }
 
-/// Serves the gateway until `shutdown` is cancelled: MCP at `/mcp`, and OpenAI-compatible
+/// Serves the gateway until `shutdown` is cancelled: health checks at `/healthz` and
+/// `/readyz`, MCP at `/mcp`, and OpenAI-compatible
 /// chat completions at `/v1/chat/completions`, naming the session in the
 /// `x-ledger-session` header, or at `/s/<session>/v1/chat/completions` for clients that
 /// can only set a base URL. An empty `allowed_hosts` accepts loopback hosts only.
@@ -51,14 +52,28 @@ pub async fn serve(
         Arc::new(LocalSessionManager::default()),
         config,
     );
+    let health = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(ready))
+        .with_state(routes.gateway.clone());
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/s/{session}/v1/chat/completions", post(chat_in_session))
         .with_state(routes)
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service)
+        .merge(health);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await
+}
+
+/// For load balancers: 200 while the gateway should get traffic, 503 while it is shutting
+/// down or cannot reach its log.
+async fn ready(State(gateway): State<Gateway>) -> Response {
+    match gateway.ready().await {
+        Ok(()) => (StatusCode::OK, "ready").into_response(),
+        Err(why) => (StatusCode::SERVICE_UNAVAILABLE, why).into_response(),
+    }
 }
 
 async fn chat(State(routes): State<ModelRoutes>, request: Request) -> Response {
@@ -104,6 +119,11 @@ async fn forward(routes: ModelRoutes, session: Option<String>, request: Request)
         session,
         body,
         credentials: model::credentials(&parts.headers),
+        traceparent: parts
+            .headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
     };
     match routes.gateway.model_call(call).await {
         Ok(logged) => model::rebuild(&logged).into_response(),

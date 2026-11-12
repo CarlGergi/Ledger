@@ -59,6 +59,7 @@ impl ModelUpstream {
         &self,
         body: &Value,
         credentials: &HeaderMap,
+        traceparent: Option<&str>,
     ) -> Result<Reply, reqwest::Error> {
         let mut request = self
             .client
@@ -68,6 +69,9 @@ impl ModelUpstream {
             Some(key) => request = request.bearer_auth(key),
             // Already reduced to credential headers by `credentials`, the one filter.
             None => request = request.headers(credentials.clone()),
+        }
+        if let Some(traceparent) = traceparent {
+            request = request.header("traceparent", traceparent);
         }
         let response = request.send().await?;
         let status = response.status();

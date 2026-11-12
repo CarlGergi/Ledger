@@ -13,6 +13,10 @@ clap.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+reqwest = { workspace = true, features = ["query", "stream"] }
+futures.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

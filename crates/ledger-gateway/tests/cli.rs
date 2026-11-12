@@ -465,3 +465,196 @@ async fn regress_runs_the_suites_agent_for_each_session_and_counts_the_outcomes(
         "{out}"
     );
 }
+
+/// A stand-in OTLP/HTTP collector: every request's path and body, in order.
+async fn spawn_collector() -> (String, Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>) {
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = axum::Router::new().fallback({
+        let received = received.clone();
+        move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let received = received.clone();
+            async move {
+                received
+                    .lock()
+                    .unwrap()
+                    .push((uri.path().to_owned(), body.to_vec()));
+                axum::http::StatusCode::OK
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (url, received)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_sends_its_traces_and_metrics_to_the_configured_collector() {
+    let db = TestDb::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files_url = spawn_tool_server(FileServer::new(dir.path()).unwrap()).await;
+    let (collector, received) = spawn_collector().await;
+    let port = ReservedPort::claim();
+    let addr = port.addr();
+    let config = dir.path().join("ledger.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+            listen = "{addr}"
+            [[upstream]]
+            name = "files"
+            url = "{files_url}"
+            [telemetry]
+            otlp_endpoint = "{collector}"
+            service_name = "ledger-under-test"
+            "#
+        ),
+    )
+    .unwrap();
+
+    let mut ledger = start_ledger(&config, db.url());
+    wait_for_listener(addr).await;
+    let agent = connect(&format!("http://{addr}/mcp"), Some("run-1"))
+        .await
+        .unwrap();
+    agent
+        .call_tool(call_params("files__read_file", json!({ "path": "x" })))
+        .await
+        .unwrap();
+    drop(agent);
+
+    // Ctrl-C: the gateway stops, and sends what it still holds before exiting.
+    let pid = ledger.0.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = ledger.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the binary did not stop");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(status.success(), "{status}");
+
+    let received = received.lock().unwrap();
+    let body_of = |path: &str| {
+        received
+            .iter()
+            .filter(|(p, _)| p == path)
+            .flat_map(|(_, body)| body.clone())
+            .collect::<Vec<u8>>()
+    };
+    let contains = |body: &[u8], text: &str| body.windows(text.len()).any(|w| w == text.as_bytes());
+    let traces = body_of("/v1/traces");
+    assert!(
+        contains(&traces, "tools/call files__read_file"),
+        "{received:?}"
+    );
+    assert!(contains(&traces, "ledger-under-test"));
+    assert!(contains(&traces, "run-1"));
+    assert!(contains(&body_of("/v1/metrics"), "ledger.calls"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_lets_a_running_call_finish_and_log_its_answer() {
+    let db = TestDb::new().await;
+    let store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(db.pool()));
+    let probe = Probe::new(store.clone(), "s");
+    let probe_url = spawn_tool_server(probe.clone()).await;
+    let port = ReservedPort::claim();
+    let addr = port.addr();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("ledger.toml");
+    let patience = PATIENCE.as_secs();
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+            listen = "{addr}"
+            call_timeout_secs = {patience}
+            shutdown_grace_secs = {patience}
+            [[upstream]]
+            name = "probe"
+            url = "{probe_url}"
+            "#
+        ),
+    )
+    .unwrap();
+    let mut ledger = start_ledger(&config, db.url());
+    wait_for_listener(addr).await;
+    let ready = format!("http://{addr}/readyz");
+    assert_eq!(reqwest::get(&ready).await.unwrap().status(), 200);
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/healthz"))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let agent = connect(&format!("http://{addr}/mcp"), Some("s"))
+        .await
+        .unwrap();
+    let call =
+        tokio::spawn(async move { agent.call_tool(call_params("probe__wait", json!({}))).await });
+    probe.wait_until_started().await;
+
+    // Told to stop with a call still running: it says it is not ready, turns new calls
+    // away, and waits for the running one.
+    let pid = ledger.0.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    eventually(|| async { reqwest::get(&ready).await.unwrap().status() == 503 }).await;
+    let late = connect(&format!("http://{addr}/mcp"), Some("late"))
+        .await
+        .unwrap();
+    // A tool that answers at once, so that if the call were taken, the test fails rather
+    // than waits on it.
+    let refused = late
+        .call_tool(call_params("probe__observe", json!({})))
+        .await
+        .unwrap_err();
+    match refused {
+        rmcp::ServiceError::McpError(e) => {
+            assert_eq!(e.code, ledger_gateway::error_codes::NOT_RECORDED)
+        }
+        other => panic!("{other}"),
+    }
+    drop(late);
+    assert!(
+        ledger.0.try_wait().unwrap().is_none(),
+        "it exited with a call running"
+    );
+
+    probe.release();
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = ledger.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the binary did not stop");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(status.success(), "{status}");
+    // The answer may not reach the agent: the gateway stops once it is logged, and closes
+    // the agent's connection. A retry gets it from the log. The client would wait forever.
+    call.abort();
+
+    let events = store.session_events("s").await.unwrap();
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [EventKind::CallRequest, EventKind::CallResponse]);
+    assert_eq!(events[1].outcome, Some(Outcome::Ok));
+    assert!(store.session_events("late").await.unwrap().is_empty());
+}

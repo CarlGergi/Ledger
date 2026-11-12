@@ -1,8 +1,67 @@
-# Ledger
+<h1 align="center">Ledger</h1>
 
-A crash-safe gateway and time-travel debugger for AI agents. Ledger sits between an agent and the tools it calls through [MCP](https://modelcontextprotocol.io). The agent connects to Ledger as if it were its tool server and needs no changes. Ledger records every call in PostgreSQL before forwarding it.
+<p align="center">
+  <b>A crash-safe gateway and time-travel debugger for AI agents.</b><br>
+  Every tool call and model call is recorded before it runs. Retries never send the same email twice.<br>
+  Any run can be inspected step by step, forked onto another model, or replayed as a regression test.
+</p>
 
-**Status:** milestones 1 to 5 are working: the gateway, retries and failover between gateway copies, the simulation, the VS Code extension, a proxy that logs model calls, forking a session, and regression replay against a new model. Benchmarks, tracing and a cloud deployment are next; see [Roadmap](#roadmap).
+<p align="center">
+  <a href="https://github.com/CarlGergi/Ledger/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/CarlGergi/Ledger/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Rust 1.99" src="https://img.shields.io/badge/Rust-1.99-B7410E?logo=rust&logoColor=white">
+  <img alt="Tokio" src="https://img.shields.io/badge/async-Tokio-463E5C">
+  <img alt="PostgreSQL 17" src="https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white">
+  <img alt="Model Context Protocol" src="https://img.shields.io/badge/protocol-MCP-000000">
+  <img alt="OpenAI-compatible" src="https://img.shields.io/badge/models-OpenAI--compatible-412991">
+  <img alt="OpenTelemetry" src="https://img.shields.io/badge/tracing-OpenTelemetry-F5A800?logo=opentelemetry&logoColor=white">
+  <img alt="TypeScript VS Code extension" src="https://img.shields.io/badge/VS%20Code-extension-007ACC?logo=typescript&logoColor=white">
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-image-2496ED?logo=docker&logoColor=white">
+  <img alt="Azure Container Apps" src="https://img.shields.io/badge/Azure-Container%20Apps-0078D4">
+</p>
+
+<p align="center">
+  <img alt="Duplicate side effects" src="https://img.shields.io/badge/duplicate%20side%20effects-0%20of%201%2C000-2EA44F">
+  <img alt="Simulation" src="https://img.shields.io/badge/simulation-1%2C000%2C000%20seeds%2C%200%20failures-2EA44F">
+  <img alt="Injected bugs caught" src="https://img.shields.io/badge/injected%20bugs%20caught-111%20of%20111-2EA44F">
+</p>
+
+## At a glance
+
+| What was measured | Without Ledger | With Ledger | Reproduce |
+| --- | --: | --: | --- |
+| Duplicate side effects, 1,000 calls, 10% of replies lost after the tool ran | 108 | **0** | `make bench-duplicates` |
+| Duplicate side effects, 1,000 calls, 30% of replies lost | 421 | **0** | `make bench-duplicates` |
+| Unsafe calls that might have run, 30% of replies lost | repeated blindly | **301 flagged for a person, 0 repeated** | `make bench-duplicates` |
+| Simulated runs with crashes, paused copies and lost messages | | **1,000,000 seeds, 0 invariant violations** (19.7 million calls, 10.6 million takeovers); 10,000 on every CI run | `make simulate` |
+| Bugs deliberately injected into the gateway and store | | **111 of 111 caught by a test** | `make breakage` |
+| Whole test suite under CPU starvation and three-way contention | | **230 runs, 0 failures** | `make soak` |
+| Latency Ledger adds per call, median | | **3.1 to 4.5 ms** in a session's first 100 calls; 6.0 to 8.4 ms by call 1,000 | `make bench-overhead` |
+| Calls per second, one gateway copy, 16 clients | | **528 to 828** | `make bench-overhead` |
+
+Every number above comes from one command, and `make reproduce` runs all but the overhead benchmark, which needs a quiet machine. [Benchmarks](#benchmarks) has the full tables with the machine and its load. Overhead ranges are over four runs on a laptop with other apps running.
+
+## Highlights
+
+- **Write-ahead for agents.** Each call is committed to PostgreSQL before it is forwarded, and its answer before the agent gets it. Nothing reaches the agent that the log does not hold.
+- **Safe retries.** Tools are classed by how safely they repeat. Retries are answered from the log, keyed calls reuse their idempotency key, and calls that might have run are flagged for a person, never run twice.
+- **Several copies, one owner.** Leases with fencing tokens, checked in the statement that writes, so a paused copy cannot write after another has taken over.
+- **Proven by simulation.** Three gateway copies, a store, tools and agents in one deterministic thread; any failing seed replays exactly.
+- **Time travel.** A VS Code extension to step through any session, and forks that replay a run up to a step and go live on another model.
+- **Regression replay.** Replay recorded runs on a new model with every tool answered from the log, and see the first step where behaviour changed.
+- **Observable and deployable.** OpenTelemetry traces and metrics, graceful shutdown with health checks, a container image, and Azure Container Apps templates.
+
+**Status:** milestones 1 to 5 are complete. Milestone 6 has tracing, the email demo, graceful shutdown and the Azure templates; the overhead benchmark and the deployment itself remain. See [Roadmap](#roadmap).
+
+<details>
+<summary><b>Contents</b></summary>
+
+- [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration) · [Inspecting the log](#inspecting-the-log)
+- [VS Code extension](#vs-code-extension) · [Effect classes](#effect-classes) · [Retries and calls in doubt](#retries-and-calls-in-doubt) · [Several gateway copies](#several-gateway-copies)
+- [Model calls](#model-calls) · [Forking a session](#forking-a-session) · [Regression replay](#regression-replay) · [Traces and metrics](#traces-and-metrics)
+- [The email demo](#the-email-demo) · [Stopping and health checks](#stopping-and-health-checks) · [Deploying to Azure](#deploying-to-azure)
+- [Benchmarks](#benchmarks) · [Simulation](#simulation) · [Testing](#testing) · [Layout](#layout) · [Current limits](#current-limits) · [Roadmap](#roadmap)
+
+</details>
 
 ## Quick start
 
@@ -29,11 +88,23 @@ http://127.0.0.1:7100/mcp
 
 ## How it works
 
-```text
-agent  --MCP-->  Ledger  --MCP-->  tool servers
-                   |
-               PostgreSQL
-            (append-only log)
+```mermaid
+flowchart LR
+    agent["Agent<br/>(any MCP client)"]
+    ledger["Ledger gateway<br/>Rust · several copies"]
+    tools["MCP tool servers<br/>email, files, payments"]
+    model["Model provider<br/>OpenAI-compatible"]
+    log[("PostgreSQL<br/>append-only event log")]
+    vscode["VS Code extension<br/>timeline · inspect · replay"]
+    otel["OpenTelemetry<br/>collector"]
+
+    agent -- "MCP tools/call" --> ledger
+    agent -- "chat completions" --> ledger
+    ledger -- "forwarded once" --> tools
+    ledger -- "forwarded once" --> model
+    ledger <-- "every call, before it runs" --> log
+    log --> vscode
+    ledger -. "spans and metrics" .-> otel
 ```
 
 For each `tools/call`, the gateway does three things in order:
@@ -93,10 +164,12 @@ The gateway reads a TOML file; see [`config/ledger.toml`](config/ledger.toml).
 | `call_timeout_secs` | `60` | How long a call waits for its tool, or for a database connection |
 | `connect_timeout_secs` | `5` | How long a tool server has to accept a new connection |
 | `lease_secs` | `30` | How long a session stays with this copy after its last append; see below |
+| `shutdown_grace_secs` | `25` | How long a stopping gateway waits for running calls; see [Stopping and health checks](#stopping-and-health-checks) |
 | `effect_overrides` | none | File correcting what tools claim about their effects, relative to this one |
 | `allowed_hosts` | loopback only | `Host` values to accept |
 | `[[upstream]]` | none | A tool server: `name` and `url` |
 | `[model]` | none | An OpenAI-compatible model to proxy: `url`, `api_key_env`, `timeout_secs` (default `300`); see [Model calls](#model-calls) |
+| `[telemetry]` | none | An OTLP/HTTP collector for traces and metrics: `otlp_endpoint`, `service_name` (default `ledger`), `metrics_interval_secs` (default `60`); see [Traces and metrics](#traces-and-metrics) |
 
 ## Inspecting the log
 
@@ -272,6 +345,144 @@ Results of `make regress`, which records three runs with the scripted `reporter-
 
 The six recorded tool calls were never run again: each replay was answered from the log or turned down. The scripted models' token counts are a quarter of the characters they handle, not real tokens, so they are left out here.
 
+## Traces and metrics
+
+Ledger reports through OpenTelemetry, over OTLP/HTTP, to the collector named in `[telemetry]`, or to wherever the standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable points. With neither set, it reports nothing.
+
+**One span per call,** to a tool or to the model, as a server span. Names and attributes follow OpenTelemetry's conventions for MCP and generative AI where they have one: `tools/call <tool>` with `mcp.method.name` and `gen_ai.tool.name`, and `chat <model>` with `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens`. Ledger's own attributes say where the call is in the log and what happened to it:
+
+| Attribute | Value |
+| --- | --- |
+| `ledger.session`, `ledger.seq` | The session, and the call's sequence number in its log |
+| `ledger.effect.class` | `read_only`, `idempotent`, `keyed` or `at_most_once` |
+| `ledger.decision` | `new`, `retry_waited`, `retry_from_log`, `retry_rerun`, `retry_in_doubt`, `step_reused`, `replayed`, `fork_refused` or `fork_diverged` |
+| `ledger.outcome` | What the agent got: `ok`, `tool_error`, `in_doubt`, `not_recorded`, `outcome_not_recorded`, and so on. Anything but `ok` also sets the span's error status and `error.type` |
+
+If the agent sends a W3C `traceparent` header, or a `traceparent` in a tool call's `_meta`, the call's span joins the agent's trace, and a model call passes its own span on to the model as the parent. A tool call's span marks the moment it was forwarded.
+
+**Metrics:**
+
+| Metric | What it counts |
+| --- | --- |
+| `ledger.calls` | Calls, by `ledger.call.kind` (`tool` or `model`), `ledger.decision` and `ledger.outcome` |
+| `ledger.call.duration` | Seconds per call, logging included, by kind and outcome |
+| `ledger.in_doubt` | Calls flagged for a person, by `ledger.flagged.by` (`retry` or `takeover`) |
+| `ledger.leases` | Sessions this copy took, and with `ledger.lease.takeover`, whether from another copy |
+| `ledger.fenced` | Appends refused because another copy had taken the session |
+
+On Ctrl-C the gateway sends whatever it still holds before it exits.
+
+## The email demo
+
+The case Ledger exists for: an email goes out, the answer is lost on the way back, and the agent sends it again.
+
+```bash
+make demo-agentmail
+```
+
+It runs one agent that sends one email and retries, with a fresh connection, when no answer comes. A proxy forwards the first call, lets the tool run, and then loses the answer. Three runs, each counting the emails AgentMail actually sent:
+
+| Run | The agent | Emails sent |
+| --- | --- | --: |
+| Straight to the tool | Answered after 2 attempts | 2 |
+| Through Ledger, answer lost on the way to the agent | Answered after 2 attempts | 1 |
+| Through Ledger, answer lost on the way from the tool | Answered after 2 attempts | 1 |
+
+In the second run, the retry names the same step, so Ledger answers it from the log. In the third, the call has no answer in the log, so it is in doubt. `send_email` takes an idempotency key, so Ledger sends it again with the same key, and AgentMail's own idempotency (`Idempotency-Key`) sends nothing new. Ledger's keys contain `:`, which AgentMail does not accept, so the tool server passes on a SHA-256 of each key instead: the same key every time for the same call.
+
+Without credentials, the demo uses a local stand-in for AgentMail's API that keeps its documented rules for keys: a repeat returns the first message, a repeat with other content is a 409, and an invalid key is a 400. `make reproduce` always uses the stand-in. To send real email, four messages in all:
+
+```bash
+export AGENTMAIL_API_KEY=...            # an AgentMail key with message_send permission
+export AGENTMAIL_INBOX=you@agentmail.to # an inbox of yours to send from
+export AGENTMAIL_TO=you@example.com     # where the demo emails go
+make demo-agentmail
+```
+
+The key is read only from the environment, never from a command line or the log.
+
+## Stopping and health checks
+
+On Ctrl-C or SIGTERM, the gateway stops being ready and turns new calls away with `-32050` (not recorded, not forwarded, so safe to send elsewhere). It keeps serving until every call already running has logged its answer, for up to `shutdown_grace_secs`, then sends any buffered telemetry and exits. A call still running after that is left with a request and no answer, in doubt, as after a crash. An agent whose call finishes during shutdown may lose its connection before the answer arrives. The answer is in the log, so a retry gets it.
+
+| Path | Answers |
+| --- | --- |
+| `/healthz` | 200 while the process is up |
+| `/readyz` | 200 while the gateway should get traffic: not shutting down, and its database answering. 503 otherwise |
+
+## Deploying to Azure
+
+`deploy/azure` holds Bicep templates and a script for Azure Container Apps, with the log in Azure Database for PostgreSQL (Flexible Server, PostgreSQL 17, Burstable B1ms) and traces in Application Insights. The `Dockerfile` builds the gateway's image.
+
+```bash
+export LEDGER_UPSTREAMS=deploy/azure/upstreams.example.json   # your tool servers
+export LEDGER_POSTGRES_PASSWORD=...
+deploy/azure/deploy.sh preview   # compiles the templates and shows what would change; creates nothing
+deploy/azure/deploy.sh deploy    # builds the image in Azure, then deploys
+```
+
+What it sets up:
+
+- A container registry, and the image built in it with `az acr build`, so nothing is pushed from your machine. The app pulls it with a managed identity, not a password.
+- The gateway as a container app with an HTTPS endpoint. Its config is a secret mounted as a file, with `allowed_hosts` set to the app's own address, and `DATABASE_URL`, with TLS, is a secret too. Probes use `/healthz` and `/readyz`, and the platform's 30-second stop grace is longer than the gateway's own 25.
+- The environment's managed OpenTelemetry agent, which forwards the gateway's traces to Application Insights. It cannot forward metrics there, so metrics need an OTLP destination of their own.
+
+**One replica.** An MCP transport session lives in the memory of the copy that opened it, and Container Apps cannot route requests by `Mcp-Session-Id`, so more replicas would break sessions. Several copies sharing a database work today (see [Several gateway copies](#several-gateway-copies)), but each needs its own address, or a router that knows about MCP sessions.
+
+**Not yet verified:** the templates have not been compiled, and the image has not been built. Neither has been deployed.
+
+## Benchmarks
+
+### Duplicate side effects
+
+One agent makes 1,000 calls, one email or one appended line each, and retries a call until it is answered, up to 5 attempts, as agents commonly do. A proxy loses each tool call's answer with a fixed probability, after the tool has run, from a seeded generator, so a run repeats exactly. Effects are counted at the tool, never from what the agent believes. `make bench-duplicates` runs both tables.
+
+Measured 2026-11-12, 02:29 to 02:31 UTC, on a Mac17,7 (Apple M5 Max, 18 cores, 36 GB, macOS), load average 14.4 at the start and 9.6 at the end, with other projects building. The counts do not depend on load: the losses are seeded and the calls run one at a time.
+
+**10% of answers lost:**
+
+| Arrangement | Tool | Answers lost | Effects | Duplicates | Answered | Gave up | Answered from the log | Run again with the same key | Flagged in doubt |
+| --- | --- | --: | --: | --: | --: | --: | --: | --: | --: |
+| Straight to the tool | email (keyed) | 108 | 1,108 | **108** | 1,000 | 0 | | | |
+| Ledger, answer lost on the way to the agent | email (keyed) | 108 | 1,000 | **0** | 1,000 | 0 | 108 | 0 | 0 |
+| Ledger, answer lost on the way from the tool | email (keyed) | 108 | 1,000 | **0** | 1,000 | 0 | 0 | 99 | 0 |
+| Straight to the tool | append (no key) | 108 | 1,108 | **108** | 1,000 | 0 | | | |
+| Ledger, answer lost on the way to the agent | append (no key) | 108 | 1,000 | **0** | 1,000 | 0 | 108 | 0 | 0 |
+| Ledger, answer lost on the way from the tool | append (no key) | 103 | 1,000 | **0** | 897 | 103 | 309 | 0 | 103 |
+
+**30% of answers lost:**
+
+| Arrangement | Tool | Answers lost | Effects | Duplicates | Answered | Gave up | Answered from the log | Run again with the same key | Flagged in doubt |
+| --- | --- | --: | --: | --: | --: | --: | --: | --: | --: |
+| Straight to the tool | email (keyed) | 425 | 1,421 | **421** | 996 | 4 | | | |
+| Ledger, answer lost on the way to the agent | email (keyed) | 425 | 1,000 | **0** | 996 | 4 | 421 | 0 | 0 |
+| Ledger, answer lost on the way from the tool | email (keyed) | 425 | 1,000 | **0** | 996 | 4 | 0 | 289 | 0 |
+| Straight to the tool | append (no key) | 425 | 1,421 | **421** | 996 | 4 | | | |
+| Ledger, answer lost on the way to the agent | append (no key) | 425 | 1,000 | **0** | 996 | 4 | 421 | 0 | 0 |
+| Ledger, answer lost on the way from the tool | append (no key) | 301 | 1,000 | **0** | 699 | 301 | 903 | 0 | 301 |
+
+How to read it: straight to the tool, every lost answer becomes a second email. Through Ledger, a retry after an answer lost on the way to the agent is answered from the log. A keyed call whose answer was lost on the way from the tool runs again with the same key, which the tool honours. A call with no key in that position may or may not have run, so Ledger flags it for a person and tells the agent the outcome is unknown, rather than repeat it. The 4 calls that gave up at 30% lost five answers in a row; 0.3⁵ of 1,000 is 2.4.
+
+### Overhead
+
+`make bench-overhead` makes the same read-only tool call straight to the tool server and through Ledger: 1,000 calls one at a time in a fresh session, after 100 warm-up calls in another, then 16 clients making 100 calls each for calls per second. Through Ledger, a call includes deciding what it is, reading the session's log, two commits to PostgreSQL, and the forward.
+
+Four runs, 2026-11-12 02:39 to 02:42 UTC, on a Mac17,7 (Apple M5 Max, 18 cores, 36 GB, macOS), PostgreSQL 17 in Docker (OrbStack) on the same machine. **The machine was not idle:** iOS simulators, an Android emulator, a Python process and system services used 4 to 5 cores, and the load average was between 7.8 and 12.0, which is why the runs vary.
+
+| Run | Load at start | Straight to the tool, p50 / p99 | Through Ledger, p50 / p99 / max | First 100 calls, median | Calls 901 to 1,000, median | Calls/s through Ledger (straight) |
+| --- | --: | --: | --: | --: | --: | --: |
+| 1 | 12.0 | 0.19 / 0.50 ms | 5.29 / 12.05 / 17.2 ms | 3.44 ms | 6.04 ms | 797 (16,276) |
+| 2 | 9.8 | 0.26 / 0.62 ms | 5.72 / 13.19 / 21.4 ms | 3.79 ms | 6.65 ms | 713 (20,683) |
+| 3 | 9.0 | 0.23 / 0.56 ms | 4.60 / 10.91 / 22.8 ms | 3.08 ms | 6.08 ms | 828 (18,012) |
+| 4 | 7.8 | 0.21 / 0.53 ms | 6.68 / 13.42 / 22.9 ms | 4.46 ms | 8.42 ms | 528 (18,573) |
+
+What it shows:
+
+- **Ledger adds about 3 to 4.5 ms per call early in a session.** Most of that is two durable commits to PostgreSQL, which here sits in a VM, and a second HTTP hop.
+- **The cost grows with the session:** about 6 to 8.4 ms by call 1,000, because recognising a retry reads the whole session's log (see [Current limits](#current-limits)). Indexing the log by step and request id would make it flat.
+- **One copy handles 528 to 828 calls per second** with 16 clients, against 16,000 to 21,000 straight to the tool. Each call is two commits; copies share the database, so more copies add throughput until PostgreSQL is the limit.
+- **Every call opens a TCP connection,** as the MCP HTTP client does: one straight to the tool, two through Ledger. The sizes above are kept within what macOS's local ports allow at these rates.
+
 ## Simulation
 
 `make simulate` runs 10,000 seeds of a deterministic simulation. Each seed sets up three gateway copies sharing one store, a tool server, and two to five agents, all in one thread. Every random choice comes from one generator seeded by the seed, and every timer runs in simulated time. So a seed replays exactly, and a failing one prints the command that replays it with a full trace:
@@ -323,8 +534,11 @@ The simulator has not found a bug in Ledger itself. What it did find was a blind
 | `make simulate` | Runs 10,000 seeds of the deterministic simulation |
 | `make interop` | Drives the gateway with the official TypeScript MCP client, configured only with a URL |
 | `make regress` | Records three runs, replays them on each scripted model, and reports where each changed |
+| `make bench-duplicates` | Counts duplicate side effects with and without Ledger, at 10% and 30% of answers lost |
+| `make bench-overhead` | Latency and throughput Ledger adds; only on a quiet machine, so not part of `make reproduce` |
+| `make agentmail-local` | The email demo against the local stand-in for AgentMail |
 | `make vscode` | Type-checks and tests the VS Code extension |
-| `make reproduce` | Runs all of the above, plus lint |
+| `make reproduce` | Runs all of the above except the overhead benchmark, plus lint |
 | `make soak` | Repeats the whole suite under load, and fails on any failed run, PostgreSQL reset, or leftover database. About 30 minutes on a busy machine, so it is not part of `make reproduce` |
 
 Each database test gets its own randomly named database, so test runs can overlap on one server, as long as each has its own `CARGO_TARGET_DIR`: even with nothing to build, `cargo test` relinks the binaries that another run's tests may be starting. A killed test run can leave databases behind; `make db-reset` clears them, along with all recorded sessions.
@@ -362,17 +576,19 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 | `crates/ledger-store` | Event model, the `EventStore` trait, PostgreSQL and in-memory stores, migrations, the conformance suite |
 | `crates/ledger-gateway` | The gateway and the `ledger` command |
 | `crates/ledger-sim` | The deterministic simulation |
+| `crates/ledger-bench` | The duplicate-effects and overhead benchmarks |
 | `crates/ledger-testkit` | A private, automatically dropped database and reserved ports for each test |
-| `crates/ledger-tools` | Example tool servers, email and files, and a scripted OpenAI-compatible model |
-| `crates/sample-agent` | MCP clients: a scripted one, and one that a model drives |
+| `crates/ledger-tools` | Example tool servers (email, files, and AgentMail with a local stand-in for its API), a scripted OpenAI-compatible model, and a proxy that loses answers |
+| `crates/sample-agent` | MCP clients: a scripted one, one that a model drives, and one that resends an email until answered |
 | `vscode` | The VS Code extension |
 | `interop/typescript` | Interoperability check with the official client |
 | `scripts` | The breakage check, the soak, the regression replay demo, and a helper that runs the full stack |
 | `.github/workflows` | CI: lint and every test, against PostgreSQL |
+| `deploy/azure`, `Dockerfile` | Azure Container Apps deployment, and the gateway's image |
 
 ## Current limits
 
-- **Retry detection reads the whole session's log** for each call, which is fine for sessions of thousands of calls, not millions.
+- **Retry detection reads the whole session's log** for each call. Measured, that takes a call from about 3 to 4.5 ms early in a session to 6 to 8.4 ms by call 1,000 (see [Overhead](#overhead)): fine for agent sessions of hundreds of calls, not for millions.
 - **An agent that resends with a new request id and no step is not recognised as retrying,** so the tool runs again. See "The trade-off" above.
 - **A crashed copy's sessions wait for its leases.** A restarted copy cannot record in them for up to `lease_secs`, because it cannot tell itself apart from a paused original.
 - **No authentication.** Keep the gateway on loopback or behind something that authenticates.
@@ -390,4 +606,4 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 3. ~~Deterministic simulation testing with fault injection~~
 4. ~~VS Code extension: timeline, inspect, replay~~
 5. ~~Model proxy, forking a session at any step, regression replay against a new model~~
-6. Benchmarks, OpenTelemetry, Azure deployment, a real email demo
+6. Benchmarks, OpenTelemetry, Azure deployment, a real email demo: tracing, the email demo, graceful shutdown, the duplicate-effects benchmark and the Azure templates are done; the overhead benchmark and the deployment itself remain

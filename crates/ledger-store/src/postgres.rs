@@ -7,8 +7,8 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use crate::{
-    Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, SessionSummary, StoreError,
-    ToolMode,
+    CallKey, Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, SessionSummary,
+    StoreError, ToolMode,
 };
 
 pub static MIGRATOR: Migrator = sqlx::migrate!();
@@ -30,8 +30,9 @@ const APPEND: &str = "
         RETURNING last_seq
     )
     INSERT INTO events
-        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token)
-    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8 FROM bumped
+        (session_id, seq, kind, request_seq, tool, outcome, payload, args_hash, fence_token,
+         ask_step, ask_transport, ask_rpc_id)
+    SELECT $1, last_seq, $2, $3, $4, $5, $6::text::json, $7, $8, $10, $11, $12 FROM bumped
     RETURNING seq, recorded_at";
 
 // Takes the session if it is free, expired, or already this owner's, and bumps the token.
@@ -55,6 +56,60 @@ const CREATE_FORK: &str = "
     INSERT INTO forks (session_id, source_session, at_step, model, system_prompt, tools)
     SELECT session_id, $2, $3, $4, $5, $6 FROM claimed
     RETURNING session_id";
+
+// The request or retry that identifies a call, by step (the oldest) or by JSON-RPC id in a
+// transport session (the newest). Each matches an index in migration 0006 exactly.
+pub(crate) const ASK_BY_STEP: &str = "
+    SELECT seq, kind, request_seq FROM events
+    WHERE session_id = $1 AND kind IN ('call_request', 'call_retry') AND ask_step = $2
+    ORDER BY seq LIMIT 1";
+
+pub(crate) const ASK_BY_RPC_ID: &str = "
+    SELECT seq, kind, request_seq FROM events
+    WHERE session_id = $1 AND kind IN ('call_request', 'call_retry')
+      AND ask_transport = $2 AND ask_rpc_id = $3
+    ORDER BY seq DESC LIMIT 1";
+
+/// The keys a request or retry is found by, as written to their own columns: the step, the
+/// transport session, and the JSON-RPC id as compact JSON. None for other events.
+struct AskKeys {
+    step: Option<String>,
+    transport: Option<String>,
+    rpc_id: Option<String>,
+}
+
+impl AskKeys {
+    fn of(event: &NewEvent) -> Self {
+        if !matches!(event.kind, EventKind::CallRequest | EventKind::CallRetry) {
+            return Self {
+                step: None,
+                transport: None,
+                rpc_id: None,
+            };
+        }
+        let text = |key: &str| event.payload[key].as_str().map(str::to_owned);
+        Self {
+            step: text("step"),
+            transport: text("transport"),
+            rpc_id: event.payload.get("rpc_id").map(Value::to_string),
+        }
+    }
+}
+
+// The ask itself, its call, and the call's answers. Two parts rather than one condition
+// with OR, which would make PostgreSQL read the whole session: the first finds events by
+// their own number, the second answers by the call they answer.
+pub(crate) const CALL_AND_ANSWERS: &str = "
+    SELECT session_id, seq, kind, request_seq, tool, outcome, args_hash, fence_token,
+           payload::text AS payload, recorded_at
+    FROM events
+    WHERE session_id = $1 AND seq IN ($2, $3)
+    UNION
+    SELECT session_id, seq, kind, request_seq, tool, outcome, args_hash, fence_token,
+           payload::text AS payload, recorded_at
+    FROM events
+    WHERE session_id = $1 AND request_seq = $3 AND kind = 'call_response'
+    ORDER BY seq";
 
 #[derive(Debug, Clone)]
 pub struct PgEventStore {
@@ -169,6 +224,7 @@ impl EventStore for PgEventStore {
             event.session_id, lease.session_id,
             "lease is for another session"
         );
+        let keys = AskKeys::of(&event);
         let appended: Option<(i64, DateTime<Utc>)> = sqlx::query_as(APPEND)
             .bind(&event.session_id)
             .bind(event.kind.as_str())
@@ -179,6 +235,9 @@ impl EventStore for PgEventStore {
             .bind(&event.args_hash)
             .bind(lease.token)
             .bind(lease.ttl.as_secs_f64())
+            .bind(keys.step)
+            .bind(keys.transport)
+            .bind(keys.rpc_id)
             .fetch_optional(&self.pool)
             .await?;
         let (seq, recorded_at) = appended.ok_or(StoreError::Fenced)?;
@@ -235,6 +294,45 @@ impl EventStore for PgEventStore {
         rows.into_iter().map(Event::try_from).collect()
     }
 
+    async fn call_lookup(&self, session_id: &str, key: &CallKey) -> Result<Vec<Event>, StoreError> {
+        let ask: Option<(i64, String, Option<i64>)> = match (&key.step, &key.transport) {
+            (Some(step), _) => {
+                sqlx::query_as(ASK_BY_STEP)
+                    .bind(session_id)
+                    .bind(step)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+            (None, Some(transport)) => {
+                // Compact JSON, as the payload was written, so the texts compare equal.
+                let id = serde_json::to_string(&key.rpc_id)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                sqlx::query_as(ASK_BY_RPC_ID)
+                    .bind(session_id)
+                    .bind(transport)
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+            (None, None) => None,
+        };
+        let Some((seq, kind, request_seq)) = ask else {
+            return Ok(Vec::new());
+        };
+        let call = match EventKind::parse(&kind)? {
+            EventKind::CallRequest => seq,
+            _ => request_seq
+                .ok_or_else(|| StoreError::Corrupt(format!("retry #{seq} names no call")))?,
+        };
+        let rows: Vec<EventRow> = sqlx::query_as(CALL_AND_ANSWERS)
+            .bind(session_id)
+            .bind(seq)
+            .bind(call)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Event::try_from).collect()
+    }
+
     async fn create_fork(&self, fork: &Fork) -> Result<(), StoreError> {
         let created: Option<(String,)> = sqlx::query_as(CREATE_FORK)
             .bind(&fork.session_id)
@@ -249,6 +347,11 @@ impl EventStore for PgEventStore {
             Some(_) => Ok(()),
             None => Err(StoreError::SessionExists(fork.session_id.clone())),
         }
+    }
+
+    async fn healthy(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError> {
@@ -287,5 +390,54 @@ impl EventStore for PgEventStore {
                 created_at,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The plan PostgreSQL would use for `query`, with sequential scans ruled out, so that
+    /// the answer shows whether an index matches the query at all.
+    async fn plan(pool: &PgPool, query: &str, binds: &[&str]) -> String {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let explain = format!("EXPLAIN {query}");
+        let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(explain));
+        for bind in binds {
+            q = q.bind(*bind);
+        }
+        q.fetch_all(&mut *conn).await.unwrap().join("\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_lookup_query_has_an_index_that_matches_it() {
+        let db = ledger_testkit::TestDb::new().await;
+        let pool = db.pool();
+        // The key has to be in the index condition: an index on the session alone, with the
+        // key checked afterwards as a filter, would still read the whole session.
+        let in_index = |plan: &str, column: &str| {
+            plan.lines()
+                .any(|line| line.contains("Index Cond") && line.contains(column))
+        };
+        let by_step = plan(&pool, ASK_BY_STEP, &["s", "1"]).await;
+        assert!(by_step.contains("events_asks_by_step"), "{by_step}");
+        assert!(in_index(&by_step, "ask_step"), "{by_step}");
+        let by_id = plan(&pool, ASK_BY_RPC_ID, &["s", "t1", "5"]).await;
+        assert!(by_id.contains("events_asks_by_rpc_id"), "{by_id}");
+        assert!(in_index(&by_id, "ask_rpc_id"), "{by_id}");
+        // seq and request_seq are numbers: bind them through a cast.
+        let answers_query = CALL_AND_ANSWERS
+            .replace("$2", "$2::bigint")
+            .replace("$3", "$3::bigint");
+        let answers = plan(&pool, &answers_query, &["s", "1", "1"]).await;
+        assert!(answers.contains("events_answers"), "{answers}");
+        assert!(in_index(&answers, "request_seq"), "{answers}");
+        for plan in [by_step, by_id, answers] {
+            assert!(!plan.contains("Seq Scan"), "{plan}");
+        }
     }
 }

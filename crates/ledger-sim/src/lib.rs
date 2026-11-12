@@ -373,6 +373,7 @@ fn arrival(
         transport: Some(transport.to_owned()),
         step,
         params: CallToolRequestParams::new(format!("svc__{tool}")).with_arguments(arguments),
+        traceparent: None,
     }
 }
 

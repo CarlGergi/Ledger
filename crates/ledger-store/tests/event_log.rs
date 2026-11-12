@@ -151,3 +151,98 @@ fn the_arguments_hash_ignores_key_order_and_nothing_else() {
     assert_ne!(hash(json!({"a": 1})), hash(json!({"a": "1"})));
     assert_eq!(hash(json!({})).len(), 64);
 }
+
+/// Requests logged before migration 0006 had no key columns: its backfill fills them, so
+/// a retry of an old call is still recognised, except where the payload holds \u0000,
+/// which PostgreSQL cannot read and the backfill leaves alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lookup_migration_fills_in_requests_logged_before_it() {
+    let db = TestDb::new().await;
+    let pool = db.pool();
+    let hash = args_hash(&json!({}));
+    sqlx::query("INSERT INTO sessions (session_id, last_seq) VALUES ('old', 3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // As written before 0006: no key columns.
+    for (seq, payload) in [
+        (1, r#"{"step":"1","rpc_id":5,"transport":"t1"}"#),
+        (
+            2,
+            r#"{"step":"2","rpc_id":"5","transport":"t1","note":"a\u0000b"}"#,
+        ),
+    ] {
+        let statement = format!(
+            "INSERT INTO events (session_id, seq, kind, tool, payload, fence_token, args_hash)
+             VALUES ('old', {seq}, 'call_request', 't', '{payload}', 1, '{hash}')"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO events (session_id, seq, kind, request_seq, tool, outcome, payload, fence_token)
+         VALUES ('old', 3, 'call_response', 1, 't', 'ok', '{}', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = PgEventStore::new(pool.clone());
+    let key = |step: &str| ledger_store::CallKey {
+        step: Some(step.to_owned()),
+        rpc_id: json!(5),
+        transport: Some("t1".to_owned()),
+    };
+    assert!(
+        store
+            .call_lookup("old", &key("1"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The migration's backfill, exactly as written in the migration.
+    let migration = include_str!("../migrations/0006_call_lookup.sql");
+    let start = migration
+        .find("ALTER TABLE events DISABLE TRIGGER")
+        .unwrap();
+    let end = migration.find("CREATE INDEX").unwrap();
+    for statement in migration[start..end]
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+    {
+        sqlx::query(sqlx::AssertSqlSafe(statement.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let found: Vec<i64> = store
+        .call_lookup("old", &key("1"))
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(found, [1, 3]);
+    let by_id = ledger_store::CallKey {
+        step: None,
+        ..key("1")
+    };
+    assert_eq!(store.call_lookup("old", &by_id).await.unwrap()[0].seq, 1);
+    // The row holding \u0000 keeps no keys, and is still readable in full.
+    assert!(
+        store
+            .call_lookup("old", &key("2"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.session_events("old").await.unwrap().len(), 3);
+    // And the log refuses updates again.
+    let update = sqlx::query("UPDATE events SET tool = 'x' WHERE session_id = 'old'")
+        .execute(&pool)
+        .await;
+    assert!(update.is_err());
+}

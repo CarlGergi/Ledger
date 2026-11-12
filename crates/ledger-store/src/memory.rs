@@ -15,7 +15,8 @@ use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 
 use crate::{
-    Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, SessionSummary, StoreError,
+    CallKey, Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, SessionSummary,
+    StoreError, lookup_in,
 };
 
 #[derive(Debug)]
@@ -245,6 +246,12 @@ impl EventStore for MemoryStore {
             .get(session_id)
             .map(|s| s.events.clone())
             .unwrap_or_default())
+    }
+
+    async fn call_lookup(&self, session_id: &str, key: &CallKey) -> Result<Vec<Event>, StoreError> {
+        let state = self.state();
+        let events = state.sessions.get(session_id).map(|s| s.events.as_slice());
+        Ok(lookup_in(events.unwrap_or_default(), key))
     }
 
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {

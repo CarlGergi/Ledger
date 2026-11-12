@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use ledger_gateway::ModelUpstream;
 use ledger_gateway::{Gateway, McpUpstream, Upstream};
 use ledger_store::{
-    Event, EventKind, EventStore, Fork, Lease, NewEvent, PgEventStore, SessionSummary, StoreError,
-    ToolMode,
+    CallKey, Event, EventKind, EventStore, Fork, Lease, NewEvent, PgEventStore, SessionSummary,
+    StoreError, ToolMode,
 };
 use ledger_testkit::PATIENCE;
 use ledger_testkit::TestDb;
@@ -154,6 +154,10 @@ impl EventStore for FaultyStore {
         self.inner.session_events(session_id).await
     }
 
+    async fn call_lookup(&self, session_id: &str, key: &CallKey) -> Result<Vec<Event>, StoreError> {
+        self.inner.call_lookup(session_id, key).await
+    }
+
     async fn in_doubt(&self) -> Result<Vec<Event>, StoreError> {
         self.inner.in_doubt().await
     }
@@ -168,6 +172,10 @@ impl EventStore for FaultyStore {
 
     async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError> {
         self.inner.fork(session_id).await
+    }
+
+    async fn healthy(&self) -> Result<(), StoreError> {
+        self.inner.healthy().await
     }
 }
 

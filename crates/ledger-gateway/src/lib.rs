@@ -12,9 +12,10 @@ mod policy;
 pub mod regress;
 mod server;
 mod session;
+mod telemetry;
 mod upstream;
 
-pub use config::{Config, ModelConfig, UpstreamConfig};
+pub use config::{Config, ModelConfig, TelemetryConfig, UpstreamConfig};
 pub use gateway::{
     Arrival, DEFAULT_LEASE_TTL, Gateway, ModelAnswer, ModelCall, ModelFailure, error_codes,
 };
@@ -22,4 +23,5 @@ pub use model::ModelUpstream;
 pub use policy::EffectPolicy;
 pub use server::serve;
 pub use session::{SESSION_HEADER, SESSION_QUERY_PARAM, STEP_HEADER, STEP_META_KEY};
+pub use telemetry::{SCOPE as TELEMETRY_SCOPE, Telemetry};
 pub use upstream::{McpUpstream, Upstream, UpstreamError};
