@@ -36,6 +36,7 @@ REGRESS = "crates/ledger-gateway/src/regress.rs"
 TELEMETRY = "crates/ledger-gateway/src/telemetry.rs"
 AGENTMAIL = "crates/ledger-tools/src/agentmail.rs"
 LOSSY = "crates/ledger-tools/src/lossy.rs"
+SMTP = "crates/ledger-tools/src/smtp.rs"
 LOOKUP = "crates/ledger-store/src/lookup.rs"
 CALL_LOOKUP = "crates/ledger-store/migrations/0006_call_lookup.sql"
 EVENT = "crates/ledger-store/src/event.rs"
@@ -881,6 +882,63 @@ FAULTS = [
         "a_call_lookup_finds_what_the_whole_log_would",
         LOOKUP,
         [("            e.payload[\"transport\"].as_str() == Some(transport.as_str())", "            (e.payload[\"transport\"].as_str() == Some(transport.as_str()) || true)")],
+    ),
+    Fault(
+        "smtp: a repeated key sends the email again",
+        "a_repeated_key_returns_the_first_message_and_sends_nothing",
+        SMTP,
+        [("        if let Some(sent) = key.and_then(|k| keys.get(k)) {", "        if let Some(sent) = key.and_then(|k| keys.get(k)).filter(|_| false) {")],
+    ),
+    Fault(
+        "smtp: a key is kept before its email is sent",
+        "a_send_that_fails_keeps_no_key",
+        SMTP,
+        [("        self.transport\n", "        if let Some(key) = key {\n            keys.insert(key.to_owned(), Sent { message_id: id.clone() });\n        }\n        self.transport\n")],
+    ),
+    Fault(
+        "lookup: the backfill updates old rows with the lease checks in force",
+        "the_lookup_migration_fills_in_requests_logged_before_it",
+        CALL_LOOKUP,
+        [
+            ("ALTER TABLE events\n    DROP CONSTRAINT events_carry_a_fence_token,\n    DROP CONSTRAINT events_requests_carry_an_args_hash;\n", ""),
+            ("ALTER TABLE events\n    ADD CONSTRAINT events_carry_a_fence_token CHECK (fence_token IS NOT NULL) NOT VALID,\n    ADD CONSTRAINT events_requests_carry_an_args_hash\n        CHECK ((kind IN ('call_request', 'model_request')) = (args_hash IS NOT NULL)) NOT VALID;\n", ""),
+        ],
+    ),
+    Fault(
+        "shutdown: leases are kept on the way out",
+        "sigterm_lets_a_running_call_finish_and_log_its_answer",
+        GATEWAY_MAIN,
+        [("            gateway.release_leases().await;\n", "")],
+    ),
+    Fault(
+        "shutdown: a call still running takes its session back",
+        "a_call_running_when_leases_are_released_takes_nothing_back",
+        GATEWAY,
+        [("        if self.is_draining() {\n            // Its leases", "        if false {\n            // Its leases")],
+    ),
+    Fault(
+        "shutdown: a running call's heartbeat renews a released lease",
+        "a_released_lease_is_not_renewed_by_a_call_still_running",
+        GATEWAY,
+        [("                if gateway.inner.leases.lock().await.get(&lease.session_id) != Some(&lease) {", "                if false {")],
+    ),
+    Fault(
+        "store: releasing a lease does not end it",
+        "a_released_lease_can_be_taken_at_once",
+        STORE,
+        [("            \"UPDATE leases SET expires_at = now()\n", "            \"UPDATE leases SET expires_at = expires_at\n")],
+    ),
+    Fault(
+        "store: releasing an old lease ends the new owner's",
+        "releasing_a_lease_taken_over_changes_nothing",
+        STORE,
+        [("             WHERE session_id = $1 AND token = $2 AND expires_at > now()\",", "             WHERE session_id = $1 AND $2 > 0 AND expires_at > now()\",")],
+    ),
+    Fault(
+        "conformance: the memory store's release ignores the token",
+        "releasing_a_lease_taken_over_changes_nothing",
+        MEMORY,
+        [("            && row.token == lease.token\n            && row.expires_at > now", "            && row.expires_at > now")],
     ),
 ]
 

@@ -10,6 +10,7 @@
 #   LEDGER_LOCATION         Azure region (default: canadacentral)
 #   LEDGER_NAME_PREFIX      3 to 16 lowercase letters and digits (default: ledger)
 #   LEDGER_UPSTREAMS        file with the tool servers, JSON: [{"name": ..., "url": ...}]
+#   LEDGER_EXAMPLE_FILES    true to also run the example file tool server, as "files"
 #   LEDGER_MODEL_URL        OpenAI-compatible base URL to proxy, optional
 #   LEDGER_POSTGRES_PASSWORD  the database password; never stored by this script
 set -euo pipefail
@@ -17,7 +18,7 @@ cd "$(dirname "$0")/../.."
 
 mode=${1:-}
 if [[ $mode != preview && $mode != deploy ]]; then
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 fi
 
@@ -27,6 +28,7 @@ prefix=${LEDGER_NAME_PREFIX:-ledger}
 upstreams=${LEDGER_UPSTREAMS:?set LEDGER_UPSTREAMS to a JSON file of tool servers}
 : "${LEDGER_POSTGRES_PASSWORD:?set LEDGER_POSTGRES_PASSWORD}"
 model_url=${LEDGER_MODEL_URL:-}
+example_files=${LEDGER_EXAMPLE_FILES:-false}
 
 command -v az >/dev/null || { echo "install the Azure CLI first" >&2; exit 1; }
 
@@ -60,7 +62,7 @@ if [[ $mode == preview ]]; then
         --template-file deploy/azure/main.bicep \
         --parameters namePrefix="$prefix" registryName="$registry_name" \
         image="$(az acr show --name "$registry_name" --query loginServer -o tsv)/ledger:$(git rev-parse --short HEAD)" \
-        upstreams=@"$upstreams" modelUrl="$model_url" \
+        upstreams=@"$upstreams" modelUrl="$model_url" exampleFiles="$example_files" \
         --parameters @"$secrets"
     exit 0
 fi
@@ -79,7 +81,7 @@ params=(
     --resource-group "$group"
     --template-file deploy/azure/main.bicep
     --parameters namePrefix="$prefix" registryName="$registry_name" image="$image"
-    upstreams=@"$upstreams" modelUrl="$model_url"
+    upstreams=@"$upstreams" modelUrl="$model_url" exampleFiles="$example_files"
     --parameters @"$secrets"
 )
 

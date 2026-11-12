@@ -580,6 +580,7 @@ async fn sigterm_lets_a_running_call_finish_and_log_its_answer() {
             listen = "{addr}"
             call_timeout_secs = {patience}
             shutdown_grace_secs = {patience}
+            lease_secs = {patience}
             [[upstream]]
             name = "probe"
             url = "{probe_url}"
@@ -657,4 +658,11 @@ async fn sigterm_lets_a_running_call_finish_and_log_its_answer() {
     assert_eq!(kinds, [EventKind::CallRequest, EventKind::CallResponse]);
     assert_eq!(events[1].outcome, Some(Outcome::Ok));
     assert!(store.session_events("late").await.unwrap().is_empty());
+    // It released its lease on the way out: another copy takes the session at once, not
+    // when the lease would have expired, long after this test.
+    let next = store
+        .acquire_lease("s", "next copy", PATIENCE)
+        .await
+        .unwrap();
+    assert!(next.token > events[1].fence_token.unwrap());
 }

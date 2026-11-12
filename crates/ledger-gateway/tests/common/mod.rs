@@ -149,6 +149,9 @@ impl EventStore for FaultyStore {
     async fn renew_lease(&self, lease: &Lease) -> Result<(), StoreError> {
         self.inner.renew_lease(lease).await
     }
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        self.inner.release_lease(lease).await
+    }
 
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError> {
         self.inner.session_events(session_id).await

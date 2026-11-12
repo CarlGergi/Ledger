@@ -17,6 +17,7 @@ rand.workspace = true
 rand_chacha.workspace = true
 reqwest = { workspace = true, features = ["query", "stream"] }
 futures.workspace = true
+lettre.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

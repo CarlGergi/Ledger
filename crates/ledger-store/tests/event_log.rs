@@ -160,7 +160,7 @@ async fn the_lookup_migration_fills_in_requests_logged_before_it() {
     let db = TestDb::new().await;
     let pool = db.pool();
     let hash = args_hash(&json!({}));
-    sqlx::query("INSERT INTO sessions (session_id, last_seq) VALUES ('old', 3)")
+    sqlx::query("INSERT INTO sessions (session_id, last_seq) VALUES ('old', 4)")
         .execute(&pool)
         .await
         .unwrap();
@@ -188,6 +188,28 @@ async fn the_lookup_migration_fills_in_requests_logged_before_it() {
     .execute(&pool)
     .await
     .unwrap();
+    // As written before leases: no fence token and no arguments hash, which the checks
+    // added with leases let stay.
+    sqlx::query("ALTER TABLE events DROP CONSTRAINT events_carry_a_fence_token, DROP CONSTRAINT events_requests_carry_an_args_hash")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"INSERT INTO events (session_id, seq, kind, tool, payload)
+           VALUES ('old', 4, 'call_request', 't', '{"step":"4","rpc_id":9,"transport":"t0"}')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE events
+             ADD CONSTRAINT events_carry_a_fence_token CHECK (fence_token IS NOT NULL) NOT VALID,
+             ADD CONSTRAINT events_requests_carry_an_args_hash
+                 CHECK ((kind IN ('call_request', 'model_request')) = (args_hash IS NOT NULL)) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let store = PgEventStore::new(pool.clone());
     let key = |step: &str| ledger_store::CallKey {
         step: Some(step.to_owned()),
@@ -204,9 +226,7 @@ async fn the_lookup_migration_fills_in_requests_logged_before_it() {
 
     // The migration's backfill, exactly as written in the migration.
     let migration = include_str!("../migrations/0006_call_lookup.sql");
-    let start = migration
-        .find("ALTER TABLE events DISABLE TRIGGER")
-        .unwrap();
+    let start = migration.find("-- Fill them in").unwrap();
     let end = migration.find("CREATE INDEX").unwrap();
     for statement in migration[start..end]
         .split(';')
@@ -239,7 +259,27 @@ async fn the_lookup_migration_fills_in_requests_logged_before_it() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(store.session_events("old").await.unwrap().len(), 3);
+    assert_eq!(store.session_events("old").await.unwrap().len(), 4);
+    // The row from before leases has its keys too.
+    let before_leases = ledger_store::CallKey {
+        step: Some("4".to_owned()),
+        rpc_id: json!(9),
+        transport: Some("t0".to_owned()),
+    };
+    let found = store.call_lookup("old", &before_leases).await.unwrap();
+    assert_eq!(found.iter().map(|e| e.seq).collect::<Vec<_>>(), [4]);
+    // The checks are back: a new row without a fence token is refused.
+    let unfenced = sqlx::query(
+        "INSERT INTO events (session_id, seq, kind, request_seq, tool, outcome, payload)
+         VALUES ('old', 5, 'call_response', 4, 't', 'ok', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        unfenced.to_string().contains("events_carry_a_fence_token"),
+        "{unfenced}"
+    );
     // And the log refuses updates again.
     let update = sqlx::query("UPDATE events SET tool = 'x' WHERE session_id = 'old'")
         .execute(&pool)

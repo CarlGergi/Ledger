@@ -7,7 +7,8 @@
 FROM rust:1.99-slim-trixie AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p ledger-gateway --bin ledger
+RUN cargo build --release --locked -p ledger-gateway --bin ledger \
+    && cargo build --release --locked -p ledger-tools --bin file-server
 
 FROM debian:trixie-slim
 RUN apt-get update \
@@ -15,6 +16,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home ledger
 COPY --from=build /src/target/release/ledger /usr/local/bin/ledger
+# The example file tool server, for trying a deployment with no tool servers of its own.
+COPY --from=build /src/target/release/file-server /usr/local/bin/file-server
 USER ledger
 EXPOSE 7100
 ENTRYPOINT ["ledger", "serve", "--config", "/etc/ledger/ledger.toml"]

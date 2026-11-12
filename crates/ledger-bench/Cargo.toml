@@ -13,6 +13,14 @@ path = "src/duplicates.rs"
 name = "overhead"
 path = "src/overhead.rs"
 
+[[bin]]
+name = "remote"
+path = "src/remote.rs"
+
+[[bin]]
+name = "takeover"
+path = "src/takeover.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -20,12 +28,14 @@ ledger-gateway.workspace = true
 ledger-store.workspace = true
 ledger-testkit.workspace = true
 ledger-tools.workspace = true
+reqwest.workspace = true
 sample-agent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

@@ -271,6 +271,18 @@ impl EventStore for PgEventStore {
         Ok(())
     }
 
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE leases SET expires_at = now()
+             WHERE session_id = $1 AND token = $2 AND expires_at > now()",
+        )
+        .bind(&lease.session_id)
+        .bind(lease.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn in_doubt(&self) -> Result<Vec<Event>, StoreError> {
         let rows: Vec<EventRow> = sqlx::query_as(
             "SELECT session_id, seq, kind, request_seq, tool, outcome, args_hash, fence_token,

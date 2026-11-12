@@ -239,6 +239,18 @@ impl EventStore for MemoryStore {
         }
     }
 
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        let now = Instant::now();
+        let mut state = self.state();
+        if let Some(row) = state.leases.get_mut(&lease.session_id)
+            && row.token == lease.token
+            && row.expires_at > now
+        {
+            row.expires_at = now;
+        }
+        Ok(())
+    }
+
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError> {
         let state = self.state();
         Ok(state

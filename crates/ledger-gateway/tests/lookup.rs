@@ -50,6 +50,9 @@ impl EventStore for Counting {
     async fn renew_lease(&self, lease: &Lease) -> Result<(), StoreError> {
         self.inner.renew_lease(lease).await
     }
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        self.inner.release_lease(lease).await
+    }
     async fn session_events(&self, session: &str) -> Result<Vec<Event>, StoreError> {
         let events = self.inner.session_events(session).await?;
         let mut reads = self.reads.lock().unwrap();

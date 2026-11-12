@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local bench-duplicates bench-overhead stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local demo-email bench-duplicates bench-overhead bench-takeover stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"
@@ -14,9 +14,11 @@ help:
 	@echo "make regress    replay three recorded runs on each scripted model and report changes"
 	@echo "make bench-duplicates  count duplicate side effects with and without Ledger"
 	@echo "make bench-overhead    latency and throughput Ledger adds; only on a quiet machine"
+	@echo "make bench-takeover    how long a session waits after its copy is killed or stopped, about 7 minutes"
 	@echo "make soak       repeat the test suite under load, about 30 minutes; not part of reproduce"
 	@echo "make demo       run the sample agent and print its log"
-	@echo "make demo-agentmail  one email, a lost answer, a retry: sent twice, then once with Ledger"
+	@echo "make demo-email  one email, a lost answer, a retry: two in Mailpit's inbox, then one with Ledger"
+	@echo "make demo-agentmail  the same through AgentMail, or its local stand-in"
 	@echo "make stack      run the gateway and tool servers until interrupted"
 	@echo "make sessions   list recorded sessions"
 	@echo "make log SESSION=<id>  print a session's events"
@@ -73,6 +75,9 @@ demo-model: db-up
 	scripts/with-stack.sh sh -c 'session=demo-$$(date +%s); \
 		target/debug/sample-agent --session $$session --model reporter-1 >/dev/null && target/debug/ledger log $$session'
 
+demo-email: db-up
+	scripts/email-demo.sh
+
 demo-agentmail: db-up
 	scripts/agentmail-demo.sh
 
@@ -86,6 +91,10 @@ bench-duplicates: db-up
 		echo; done
 
 # Timings mislead on a busy machine; the binary refuses to measure without the flag.
+bench-takeover: db-up
+	cargo build --quiet --release -p ledger-gateway -p ledger-bench
+	target/release/takeover
+
 bench-overhead: db-up
 	cargo run --quiet --release -p ledger-bench --bin overhead -- --machine-is-quiet
 
@@ -98,7 +107,7 @@ sessions:
 log:
 	cargo run --quiet --package ledger-gateway --bin ledger -- log $(SESSION)
 
-reproduce: lint test breakage simulate interop regress agentmail-local bench-duplicates vscode
+reproduce: lint test breakage simulate interop regress demo-email agentmail-local bench-duplicates bench-takeover vscode
 
 clean:
 	cargo clean

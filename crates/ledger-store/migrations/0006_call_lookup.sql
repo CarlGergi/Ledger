@@ -15,6 +15,13 @@ ALTER TABLE events
 -- refusal is lifted for this statement alone, inside this migration's transaction, and it
 -- touches only the new columns. A payload holding \u0000 cannot be read here, so such a
 -- row keeps no keys: an old call of that kind is not recognised when retried.
+--
+-- Rows logged before leases have no fence token or arguments hash. The checks for those
+-- were added NOT VALID to let such rows stay, but an update checks its new row, so the two
+-- checks are dropped for the update and added back exactly as they were.
+ALTER TABLE events
+    DROP CONSTRAINT events_carry_a_fence_token,
+    DROP CONSTRAINT events_requests_carry_an_args_hash;
 ALTER TABLE events DISABLE TRIGGER events_no_update_or_delete;
 UPDATE events
 SET ask_step = payload->>'step',
@@ -23,6 +30,10 @@ SET ask_step = payload->>'step',
 WHERE kind IN ('call_request', 'call_retry')
   AND position('\u0000' IN payload::text) = 0;
 ALTER TABLE events ENABLE TRIGGER events_no_update_or_delete;
+ALTER TABLE events
+    ADD CONSTRAINT events_carry_a_fence_token CHECK (fence_token IS NOT NULL) NOT VALID,
+    ADD CONSTRAINT events_requests_carry_an_args_hash
+        CHECK ((kind IN ('call_request', 'model_request')) = (args_hash IS NOT NULL)) NOT VALID;
 
 CREATE INDEX events_asks_by_step
     ON events (session_id, ask_step, seq)

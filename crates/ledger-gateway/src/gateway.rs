@@ -261,6 +261,22 @@ impl Gateway {
             .is_ok()
     }
 
+    /// Ends every lease this copy holds, so other copies can take its sessions at once
+    /// instead of waiting for the leases to expire. Once shutting down, this copy takes no
+    /// session again; a call still running that needs its lease finds it gone and ends in
+    /// doubt, for the copy that takes the session to settle.
+    pub async fn release_leases(&self) {
+        let leases: Vec<Lease> = {
+            let mut leases = self.inner.leases.lock().await;
+            leases.drain().map(|(_, lease)| lease).collect()
+        };
+        for lease in leases {
+            if let Err(e) = self.inner.store.release_lease(&lease).await {
+                tracing::warn!(session = lease.session_id, error = %e, "could not release lease");
+            }
+        }
+    }
+
     /// Reports traces and metrics through `telemetry`. Call it before serving.
     pub fn with_telemetry(self, telemetry: Telemetry) -> Self {
         let mut inner = Arc::into_inner(self.inner).expect("configure the gateway before use");
@@ -579,6 +595,11 @@ impl Gateway {
         let mut leases = self.inner.leases.lock().await;
         if let Some(lease) = leases.get(session) {
             return Ok(lease.clone());
+        }
+        if self.is_draining() {
+            // Its leases may have been released already: taking one back would race the
+            // copy taking over.
+            return Err(StoreError::Fenced);
         }
         let lease = self
             .inner
@@ -968,6 +989,10 @@ impl Gateway {
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(ttl / 4).await;
+                // Released on shutdown: renewing it would hold off the copy taking over.
+                if gateway.inner.leases.lock().await.get(&lease.session_id) != Some(&lease) {
+                    return;
+                }
                 match gateway.inner.store.renew_lease(&lease).await {
                     Ok(()) => {}
                     Err(StoreError::Fenced) => {

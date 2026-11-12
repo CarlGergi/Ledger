@@ -370,6 +370,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                     "calls still running after {grace:?}; their answers will not be logged"
                 );
             }
+            gateway.release_leases().await;
             shutdown.cancel();
         }
     });

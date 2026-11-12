@@ -18,6 +18,9 @@ param image string
 @description('The MCP tool servers to put behind the gateway: [{ "name": "...", "url": "..." }].')
 param upstreams array
 
+@description('Also run the example file tool server beside the gateway, as the upstream "files", to try the deployment with no tool servers of your own.')
+param exampleFiles bool = false
+
 @description('An OpenAI-compatible base URL to proxy model calls to; empty for none.')
 param modelUrl string = ''
 
@@ -136,8 +139,9 @@ resource environment 'Microsoft.App/managedEnvironments@2024-10-02-preview' = {
 }
 
 var fqdn = '${appName}.${environment.properties.defaultDomain}'
+var allUpstreams = concat(upstreams, exampleFiles ? [ { name: 'files', url: 'http://127.0.0.1:7102/mcp' } ] : [])
 var upstreamToml = join(
-  map(upstreams, u => '[[upstream]]\nname = "${u.name}"\nurl = "${u.url}"\n'),
+  map(allUpstreams, u => '[[upstream]]\nname = "${u.name}"\nurl = "${u.url}"\n'),
   '\n'
 )
 var modelToml = empty(modelUrl) ? '' : '\n[model]\nurl = "${modelUrl}"\n'
@@ -174,34 +178,49 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
     }
     template: {
       terminationGracePeriodSeconds: 30
-      containers: [
-        {
-          name: 'ledger'
-          image: image
-          resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+      containers: concat(
+        [
+          {
+            name: 'ledger'
+            image: image
+            resources: {
+              cpu: json('0.5')
+              memory: '1Gi'
+            }
+            env: [
+              { name: 'DATABASE_URL', secretRef: 'database-url' }
+            ]
+            volumeMounts: [
+              { volumeName: 'config', mountPath: '/etc/ledger' }
+            ]
+            probes: [
+              {
+                type: 'Liveness'
+                httpGet: { path: '/healthz', port: 7100 }
+                periodSeconds: 10
+              }
+              {
+                type: 'Readiness'
+                httpGet: { path: '/readyz', port: 7100 }
+                periodSeconds: 5
+              }
+            ]
           }
-          env: [
-            { name: 'DATABASE_URL', secretRef: 'database-url' }
-          ]
-          volumeMounts: [
-            { volumeName: 'config', mountPath: '/etc/ledger' }
-          ]
-          probes: [
-            {
-              type: 'Liveness'
-              httpGet: { path: '/healthz', port: 7100 }
-              periodSeconds: 10
-            }
-            {
-              type: 'Readiness'
-              httpGet: { path: '/readyz', port: 7100 }
-              periodSeconds: 5
-            }
-          ]
-        }
-      ]
+        ],
+        exampleFiles
+          ? [
+              {
+                name: 'files'
+                image: image
+                command: [ 'file-server', '--listen', '127.0.0.1:7102', '--root', '/tmp/files' ]
+                resources: {
+                  cpu: json('0.25')
+                  memory: '0.5Gi'
+                }
+              }
+            ]
+          : []
+      )
       volumes: [
         {
           name: 'config'

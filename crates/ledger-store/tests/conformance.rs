@@ -73,6 +73,8 @@ conformance!(
     a_fork_claims_a_new_session_and_names_its_source,
     a_fork_cannot_take_a_started_session_or_name_a_missing_source,
     a_call_lookup_finds_what_the_whole_log_would,
+    a_released_lease_can_be_taken_at_once,
+    releasing_a_lease_taken_over_changes_nothing,
 );
 
 async fn sequences_start_at_one_and_have_no_gaps(store: Arc<dyn EventStore>) {
@@ -718,4 +720,34 @@ async fn a_call_lookup_finds_what_the_whole_log_would(store: Arc<dyn EventStore>
             .unwrap()
             .is_empty()
     );
+}
+
+async fn a_released_lease_can_be_taken_at_once(store: Arc<dyn EventStore>) {
+    let lease = store.acquire_lease("s", "a", HOUR).await.unwrap();
+    store.append(request("s", "t"), &lease).await.unwrap();
+    store.release_lease(&lease).await.unwrap();
+
+    let taken = store.acquire_lease("s", "b", HOUR).await.unwrap();
+    assert!(taken.token > lease.token);
+    // The released lease is fenced like any other taken over.
+    let stale = store.append(request("s", "t"), &lease).await;
+    assert!(matches!(stale, Err(StoreError::Fenced)), "{stale:?}");
+    assert!(matches!(
+        store.renew_lease(&lease).await,
+        Err(StoreError::Fenced)
+    ));
+}
+
+async fn releasing_a_lease_taken_over_changes_nothing(store: Arc<dyn EventStore>) {
+    let old = store.acquire_lease("s", "a", Duration::ZERO).await.unwrap();
+    let new = store.acquire_lease("s", "b", HOUR).await.unwrap();
+    store.release_lease(&old).await.unwrap();
+
+    // The new owner's lease still holds.
+    let taken = store.acquire_lease("s", "c", HOUR).await;
+    match taken {
+        Err(StoreError::LeaseHeld { owner }) => assert_eq!(owner, "b"),
+        other => panic!("expected the lease to be held, got {other:?}"),
+    }
+    store.append(request("s", "t"), &new).await.unwrap();
 }

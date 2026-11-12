@@ -69,6 +69,10 @@ pub trait EventStore: Send + Sync + 'static {
     /// session has been taken over.
     async fn renew_lease(&self, lease: &Lease) -> Result<(), StoreError>;
 
+    /// Ends `lease` now, so another copy can take the session at once. Does nothing if
+    /// the session has been taken over already.
+    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError>;
+
     /// All events of a session, ordered by sequence.
     async fn session_events(&self, session_id: &str) -> Result<Vec<Event>, StoreError>;
 
