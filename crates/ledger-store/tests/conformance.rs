@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ledger_store::{
-    Event, EventKind, EventStore, Lease, MemoryStore, NewEvent, Outcome, PgEventStore, StoreError,
-    args_hash,
+    Event, EventKind, EventStore, Fork, Lease, MemoryStore, NewEvent, Outcome, PgEventStore,
+    StoreError, ToolMode, args_hash,
 };
 use serde_json::json;
 
@@ -70,6 +70,8 @@ conformance!(
     a_refused_append_does_not_extend_the_lease,
     model_calls_share_the_session_sequence_and_get_one_final_answer,
     the_schema_refuses_malformed_model_calls,
+    a_fork_claims_a_new_session_and_names_its_source,
+    a_fork_cannot_take_a_started_session_or_name_a_missing_source,
 );
 
 async fn sequences_start_at_one_and_have_no_gaps(store: Arc<dyn EventStore>) {
@@ -545,4 +547,81 @@ async fn the_schema_refuses_malformed_model_calls(store: Arc<dyn EventStore>) {
         assert!(store.append(bad.clone(), &lease).await.is_err(), "{bad:?}");
     }
     assert_eq!(store.session_events("s").await.unwrap().len(), 1);
+}
+
+fn fork_of(source: &str, session: &str, at_step: i64) -> Fork {
+    Fork {
+        session_id: session.to_owned(),
+        source_session: source.to_owned(),
+        at_step,
+        model: Some("m2".to_owned()),
+        system_prompt: Some("Be brief.".to_owned()),
+        tools: ToolMode::Safe,
+    }
+}
+
+async fn a_fork_claims_a_new_session_and_names_its_source(store: Arc<dyn EventStore>) {
+    append(&store, request("src", "t")).await.unwrap();
+    assert_eq!(store.fork("src").await.unwrap(), None);
+
+    let fork = fork_of("src", "f", 2);
+    store.create_fork(&fork).await.unwrap();
+
+    assert_eq!(store.fork("f").await.unwrap(), Some(fork));
+    // The session exists, with nothing recorded yet, and records from 1.
+    let listed = store.sessions().await.unwrap();
+    let f = listed.iter().find(|s| s.session_id == "f").unwrap();
+    assert_eq!(f.event_count, 0);
+    assert_eq!(append(&store, request("f", "t")).await.unwrap().seq, 1);
+    // Other modes and no overrides round-trip too.
+    let plain = Fork {
+        model: None,
+        system_prompt: None,
+        tools: ToolMode::Replay,
+        ..fork_of("src", "g", 1)
+    };
+    store.create_fork(&plain).await.unwrap();
+    assert_eq!(store.fork("g").await.unwrap(), Some(plain));
+}
+
+async fn a_fork_cannot_take_a_started_session_or_name_a_missing_source(store: Arc<dyn EventStore>) {
+    append(&store, request("src", "t")).await.unwrap();
+    append(&store, request("busy", "t")).await.unwrap();
+
+    let started = store.create_fork(&fork_of("src", "busy", 1)).await;
+    assert!(
+        matches!(started, Err(StoreError::SessionExists(_))),
+        "{started:?}"
+    );
+    store.create_fork(&fork_of("src", "f", 1)).await.unwrap();
+    let twice = store.create_fork(&fork_of("src", "f", 1)).await;
+    assert!(
+        matches!(twice, Err(StoreError::SessionExists(_))),
+        "{twice:?}"
+    );
+
+    let empty_model = Fork {
+        model: Some(String::new()),
+        ..fork_of("src", "x3", 1)
+    };
+    for bad in [
+        fork_of("missing", "x1", 1),
+        fork_of("src", "x2", 0),
+        empty_model,
+        fork_of("src", "src", 1),
+    ] {
+        assert!(store.create_fork(&bad).await.is_err(), "{bad:?}");
+    }
+    // Nothing refused claimed a session.
+    let mut names: Vec<String> = store
+        .sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["busy", "f", "src"]);
+    assert_eq!(store.fork("busy").await.unwrap(), None);
+    assert_eq!(store.session_events("busy").await.unwrap().len(), 1);
 }

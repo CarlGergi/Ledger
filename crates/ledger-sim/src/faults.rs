@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ledger_gateway::{Upstream, UpstreamError};
-use ledger_store::{Event, EventStore, Lease, MemoryStore, NewEvent, SessionSummary, StoreError};
+use ledger_store::{
+    Event, EventStore, Fork, Lease, MemoryStore, NewEvent, SessionSummary, StoreError,
+};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Tool, ToolAnnotations,
 };
@@ -155,6 +157,15 @@ impl EventStore for CopyStore {
 
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
         self.inner.sessions().await
+    }
+
+    async fn create_fork(&self, fork: &Fork) -> Result<(), StoreError> {
+        self.inner.create_fork(fork).await
+    }
+
+    async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError> {
+        self.life.step().await;
+        self.inner.fork(session_id).await
     }
 
     async fn in_doubt(&self) -> Result<Vec<Event>, StoreError> {

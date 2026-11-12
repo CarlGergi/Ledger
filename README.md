@@ -2,7 +2,7 @@
 
 A crash-safe gateway and time-travel debugger for AI agents. Ledger sits between an agent and the tools it calls through [MCP](https://modelcontextprotocol.io). The agent connects to Ledger as if it were its tool server and needs no changes. Ledger records every call in PostgreSQL before forwarding it.
 
-**Status:** the gateway, retries and failover between gateway copies, the simulation, the VS Code extension, and a proxy that logs model calls are working. Forking a session and regression replay against a new model are next; see [Roadmap](#roadmap).
+**Status:** the gateway, retries and failover between gateway copies, the simulation, the VS Code extension, a proxy that logs model calls, and forking a session are working. Regression replay against a new model is next; see [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -108,7 +108,7 @@ make sessions
 make log SESSION=<id>
 ```
 
-`ledger log <id> --json` prints full events, including arguments and results, one per line, and `ledger sessions --json` lists sessions the same way. `ledger in-doubt` lists every call flagged for a person (see below).
+`ledger log <id> --json` prints full events, including arguments and results, one per line, and `ledger sessions --json` lists sessions the same way. `ledger in-doubt` lists every call flagged for a person (see below). `ledger fork` starts a fork of a session; see [Forking a session](#forking-a-session).
 
 ## VS Code extension
 
@@ -211,6 +211,31 @@ The session is the one the agent's tool calls use. `POST /chat/completions` is p
 **Model calls have no effects,** so they are never deduplicated, never in doubt, and never flagged when a copy takes a session over. An agent that asks again makes a new model call.
 
 `make demo-model` runs the demo task decided by a scripted model, `reporter-1`, served by `model-server` on port 7103. Its replies depend only on the conversation, which keeps the tests repeatable. `reporter-2` and `reporter-3` differ from it on purpose, for testing replay against a new model.
+
+## Forking a session
+
+A fork runs an agent again from any step of a recorded session, on another model or with another system prompt, to see what would have changed. Everything before the step is answered from the recorded session's log, so the agent gets there exactly as it did the first time, and nothing runs twice.
+
+```bash
+ledger fork <session> --at <step> [--model <name>] [--system-prompt-file <file>] [--tools safe|replay|live] [--as <id>]
+```
+
+This prints the new session's id. Run the agent again under that session, through the gateway, for its tools and its model calls alike. `<step>` is a sequence number in the source's log (`ledger log`, or the step counter in the extension's replay). One past the last event replays the whole run.
+
+How the fork answers each call:
+
+- **Before the step,** each call, to a tool or to the model, is matched to a call the source made before the step, with the same kind, name and arguments. It gets that call's recorded answer, and nothing is forwarded. Each source call answers once. A call with no match means the agent has already gone another way, so the fork is not a fork of that run: a tool call gets error `-32053`, and a model call gets HTTP 409 with the same code.
+- **From the step on,** model calls go to the model, as `--model` if given, with `--system-prompt-file` in place of the agent's system message if given. Tool calls depend on `--tools`:
+
+| `--tools` | A call the source made, with the same arguments | A read-only call it did not make | Any other call |
+| --- | --- | --- | --- |
+| `safe` (default) | Answered from the source's log | Runs | Not run: the agent gets a tool error saying why |
+| `replay` | Answered from the source's log | Not run | Not run |
+| `live` | Runs | Runs | Runs |
+
+So by default a fork can explore what a new model would do without sending a second email. Everything it does is logged in the fork's own session: answers taken from the source carry `replayed_from`, calls turned down are logged as `refused`, and live model calls record both the request the agent made and what was sent. `ledger log` starts with what the session is a fork of.
+
+Which source calls have been used is read from the fork's own log on every call, so a fork carries on correctly after a crash or on another gateway copy. A session can become a fork only before it has recorded anything: `ledger fork --as` refuses a session that exists.
 
 ## Simulation
 
@@ -316,6 +341,7 @@ Machine: Mac17,7, Apple M5 Max, 18 cores, 36 GB, Darwin 27.0.0
 - **A crashed copy's sessions wait for its leases.** A restarted copy cannot record in them for up to `lease_secs`, because it cannot tell itself apart from a paused original.
 - **No authentication.** Keep the gateway on loopback or behind something that authenticates.
 - **Tools only.** Resources and prompts are not passed through, and neither are progress notifications.
+- **A fork needs an agent that asks the same things when given the same answers.** One whose requests carry timestamps, random ids or anything else that changes between runs goes another way at its first call, and the fork refuses it with `-32053` rather than pretend to replay it.
 - **Chat completions only.** The model proxy handles `POST /chat/completions`, not the Responses API, embeddings, or `GET /models`.
 - **Streamed replies arrive all at once,** because each is logged in full before it is sent, so the agent loses streaming's early first token. The alternative keeps both: log each chunk as an event of its own, then forward it, so the agent streams and the log still leads by one chunk. A copy that died mid-stream would leave a reply with no end, which replay would have to treat as cut off. Planned only after milestone 6, if there is time.
 - **The agent's `_meta` is logged but not forwarded,** because it describes the agent's exchange with the gateway.

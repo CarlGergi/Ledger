@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::join_all;
-use ledger_store::{Event, EventKind, EventStore, Lease, NewEvent, Outcome, StoreError, args_hash};
+use ledger_store::{
+    Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, StoreError, args_hash,
+};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, DiscoverRequestMethod, DiscoverResult,
-    ErrorCode, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerConfig, ServerResult, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverRequestMethod,
+    DiscoverResult, ErrorCode, Implementation, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerConfig, ServerResult, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler};
@@ -17,6 +19,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::dedup::{self, Decision, Incoming};
+use crate::fork::{self, Asked, Replay};
 use crate::model::{self, ModelUpstream};
 use crate::policy::{DEFAULT_KEY_PARAM, Effect, EffectClass, EffectPolicy};
 use crate::session::{resolve_session, resolve_step};
@@ -37,6 +40,9 @@ pub mod error_codes {
     /// The tool may have run, and nobody knows whether it did. This includes calls that
     /// ledger has flagged for a person, because running them again is not safe.
     pub const OUTCOME_UNKNOWN: ErrorCode = ErrorCode(-32052);
+    /// In a fork, the agent asked for something its source did not ask for before the
+    /// fork step, so the run is no longer a fork of the source.
+    pub const FORK_DIVERGED: ErrorCode = ErrorCode(-32053);
 }
 
 /// How long a session stays with a copy that has stopped appending to it.
@@ -68,6 +74,9 @@ struct Inner {
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Calls this copy is running, so that a retry can wait for the same result.
     in_flight: Mutex<HashMap<CallId, watch::Receiver<Option<Answer>>>>,
+    /// Which sessions are forks. A session that has recorded anything can never become
+    /// one, so once it has, the answer is kept either way.
+    forks: Mutex<HashMap<String, Option<Fork>>>,
 }
 
 /// One `tools/call` as it arrived: what the gateway knows about a call besides the call.
@@ -110,6 +119,13 @@ pub struct ModelFailure {
 /// The logged reply on success, which the agent's answer is rebuilt from.
 pub type ModelAnswer = Result<Value, ModelFailure>;
 
+/// What a fork does with a model call.
+enum ModelPlan {
+    /// Answered from the source's log, or turned down; logged either way.
+    Answered(ModelAnswer),
+    Live,
+}
+
 enum Forwarded {
     Answered(Result<CallToolResponse, UpstreamError>),
     TimedOut,
@@ -145,6 +161,7 @@ impl Gateway {
                 leases: tokio::sync::Mutex::default(),
                 session_locks: Mutex::default(),
                 in_flight: Mutex::default(),
+                forks: Mutex::default(),
             }),
         }
     }
@@ -205,27 +222,51 @@ impl Gateway {
         };
         let session = call.session.as_str();
         let name = call.body["model"].as_str().unwrap_or_default().to_owned();
-        let payload = json!({ "request": call.body });
-        let request = NewEvent::model_request(session, &name, &call.body, payload);
-        let seq = match self.append(request).await {
-            Ok(event) => event.seq,
-            Err(e) => {
-                tracing::error!(session, model = name, error = %e, "could not record model call");
-                return Err(model_failure(
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    error_codes::NOT_RECORDED,
-                    "not_recorded",
-                    &format!("ledger could not record this call, so it was not sent: {e}"),
-                ));
-            }
+        let not_recorded = |e: StoreError| {
+            tracing::error!(session, model = name, error = %e, "could not record model call");
+            model_failure(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::NOT_RECORDED,
+                "not_recorded",
+                &format!("ledger could not record this call, so it was not sent: {e}"),
+            )
         };
+        let mut payload = json!({ "request": call.body });
+        let mut sent = call.body.clone();
+
+        // A fork decides and logs under the session's lock, so that two calls at once
+        // cannot both be answered from the same source call.
+        let fork = self.fork_of(session).await.map_err(not_recorded)?;
+        let lock = self.session_lock(session);
+        let guard = match &fork {
+            Some(_) => Some(lock.lock().await),
+            None => None,
+        };
+        if let Some(fork) = &fork {
+            match self.replay_model(fork, &call.body, &name).await {
+                Ok(ModelPlan::Answered(answer)) => return answer,
+                Ok(ModelPlan::Live) => {
+                    if let Some(model) = &fork.model {
+                        sent["model"] = json!(model);
+                    }
+                    if let Some(prompt) = &fork.system_prompt {
+                        set_system_prompt(&mut sent, prompt);
+                    }
+                    if sent != call.body {
+                        payload["sent"] = sent.clone();
+                    }
+                }
+                Err(e) => return Err(not_recorded(e)),
+            }
+        }
+
+        let request = NewEvent::model_request(session, &name, &call.body, payload);
+        let seq = self.append(request).await.map_err(not_recorded)?.seq;
+        drop(guard);
 
         let heartbeat = self.heartbeat(session).await;
-        let sent = tokio::time::timeout(
-            upstream.timeout(),
-            upstream.send(&call.body, &call.credentials),
-        )
-        .await;
+        let sent =
+            tokio::time::timeout(upstream.timeout(), upstream.send(&sent, &call.credentials)).await;
         drop(heartbeat);
 
         let (outcome, logged, failure) = match sent {
@@ -277,6 +318,56 @@ impl Gateway {
         }
     }
 
+    /// Answers a model call in a fork from its source's log, or turns it down, logging both
+    /// sides. `Live` means it is to be sent, with the fork's model and prompt.
+    async fn replay_model(
+        &self,
+        fork: &Fork,
+        body: &Value,
+        name: &str,
+    ) -> Result<ModelPlan, StoreError> {
+        let session = fork.session_id.as_str();
+        let own = self.inner.store.session_events(session).await?;
+        let source = self
+            .inner
+            .store
+            .session_events(&fork.source_session)
+            .await?;
+        let hash = args_hash(body);
+        let asked = Asked {
+            kind: EventKind::ModelRequest,
+            name,
+            args_hash: &hash,
+            read_only: true,
+        };
+        let mut payload = json!({ "request": body });
+        let (outcome, logged, answer) = match fork::decide(fork, &source, &own, &asked) {
+            Replay::Live => return Ok(ModelPlan::Live),
+            Replay::Source { request, answer } => {
+                let from = json!({ "session": fork.source_session, "seq": request.seq });
+                payload["replayed_from"] = from.clone();
+                let mut logged = answer.payload.clone();
+                logged["replayed_from"] = from;
+                let outcome = answer.outcome.unwrap_or(Outcome::Ok);
+                (outcome, logged, Ok(answer.payload.clone()))
+            }
+            Replay::Refuse(reason) | Replay::Diverged(reason) => {
+                let failure = model_failure(
+                    http::StatusCode::CONFLICT,
+                    error_codes::FORK_DIVERGED,
+                    "fork_diverged",
+                    &reason,
+                );
+                (Outcome::Refused, json!({ "reason": reason }), Err(failure))
+            }
+        };
+        let request = NewEvent::model_request(session, name, body, payload);
+        let seq = self.append(request).await?.seq;
+        let response = NewEvent::model_response(session, seq, name, outcome, logged);
+        self.append(response).await?;
+        Ok(ModelPlan::Answered(answer))
+    }
+
     /// Sets how long a session stays with this copy after its last append. Another copy
     /// can take the session over only once that has passed. Call it before serving.
     pub fn with_lease_ttl(self, ttl: Duration) -> Self {
@@ -292,11 +383,38 @@ impl Gateway {
     /// back here: whether it may is a question for the session's next call.
     async fn append(&self, event: NewEvent) -> Result<Event, StoreError> {
         let lease = self.lease(&event.session_id).await?;
+        let session = event.session_id.clone();
         let appended = self.inner.store.append(event, &lease).await;
-        if matches!(appended, Err(StoreError::Fenced)) {
-            self.forget_lease(&lease).await;
+        match &appended {
+            Err(StoreError::Fenced) => self.forget_lease(&lease).await,
+            // It has recorded something now, so if it is not a fork it never will be.
+            Ok(_) => {
+                let mut forks = self.inner.forks.lock().expect("lock poisoned");
+                forks.entry(session).or_insert(None);
+            }
+            Err(_) => {}
         }
         appended
+    }
+
+    /// The fork this session is, if it is one.
+    async fn fork_of(&self, session: &str) -> Result<Option<Fork>, StoreError> {
+        let known = self
+            .inner
+            .forks
+            .lock()
+            .expect("lock poisoned")
+            .get(session)
+            .cloned();
+        if let Some(known) = known {
+            return Ok(known);
+        }
+        let fork = self.inner.store.fork(session).await?;
+        if fork.is_some() {
+            let mut forks = self.inner.forks.lock().expect("lock poisoned");
+            forks.insert(session.to_owned(), fork.clone());
+        }
+        Ok(fork)
     }
 
     async fn forget_lease(&self, lease: &Lease) {
@@ -442,6 +560,23 @@ impl Gateway {
             Decision::New | Decision::StepReused(_) => {
                 payload["effect"] = json!(effect);
                 payload["params"] = json!(arrival.params);
+                if let Decision::New = decision
+                    && let Some(fork) = self.fork_of(session).await.map_err(not_recorded)?
+                {
+                    let asked = Asked {
+                        kind: EventKind::CallRequest,
+                        name: tool,
+                        args_hash: &hash,
+                        read_only: effect.class == EffectClass::ReadOnly,
+                    };
+                    let answered = self
+                        .replay_tool(&fork, &events, &asked, &arguments, payload.clone())
+                        .await
+                        .map_err(not_recorded)?;
+                    if let Some(answered) = answered {
+                        return Ok(answered);
+                    }
+                }
                 let request = NewEvent::request(session, tool, &arguments, payload);
                 let seq = self.append(request).await.map_err(not_recorded)?.seq;
                 if let Decision::StepReused(earlier) = decision {
@@ -484,6 +619,53 @@ impl Gateway {
                 Ok((seq, plan))
             }
         }
+    }
+
+    /// Answers a tool call in a fork from its source's log, or turns it down, logging both
+    /// sides here. None means the call is to run as it would anywhere else.
+    async fn replay_tool(
+        &self,
+        fork: &Fork,
+        own: &[Event],
+        asked: &Asked<'_>,
+        arguments: &Value,
+        mut payload: Value,
+    ) -> Result<Option<(i64, Plan)>, StoreError> {
+        let session = fork.session_id.as_str();
+        let tool = asked.name;
+        let source = self
+            .inner
+            .store
+            .session_events(&fork.source_session)
+            .await?;
+        let (outcome, logged, failure) = match fork::decide(fork, &source, own, asked) {
+            Replay::Live => return Ok(None),
+            Replay::Source { request, answer } => {
+                let from = json!({ "session": fork.source_session, "seq": request.seq });
+                payload["replayed_from"] = from.clone();
+                let mut logged = answer.payload.clone();
+                logged["replayed_from"] = from;
+                (answer.outcome.unwrap_or(Outcome::InDoubt), logged, None)
+            }
+            Replay::Refuse(reason) => {
+                let result = CallToolResult::error(vec![ContentBlock::text(reason.clone())]);
+                let logged = json!({ "reason": reason, "result": result });
+                (Outcome::Refused, logged, None)
+            }
+            Replay::Diverged(reason) => {
+                let error = ErrorData::new(error_codes::FORK_DIVERGED, reason.clone(), None);
+                (Outcome::Refused, json!({ "reason": reason }), Some(error))
+            }
+        };
+        let request = NewEvent::request(session, tool, arguments, payload);
+        let seq = self.append(request).await?.seq;
+        let response = NewEvent::response(session, seq, tool, outcome, logged);
+        let answer = self.append(response).await?;
+        let answer = match failure {
+            Some(error) => Err(error),
+            None => from_log(&answer, session),
+        };
+        Ok(Some((seq, Plan::Answer(answer))))
     }
 
     /// A retry of a call that has no final answer and is not running here: it may or may
@@ -711,6 +893,18 @@ impl Drop for AbortOnDrop {
 
 /// The idempotency key for a call: the same for every attempt at it, and different for
 /// every other call.
+/// Puts `prompt` in place of the conversation's system message, or first if it has none.
+fn set_system_prompt(body: &mut Value, prompt: &str) {
+    let message = json!({ "role": "system", "content": prompt });
+    match body["messages"].as_array_mut() {
+        Some(messages) if messages.first().is_some_and(|m| m["role"] == "system") => {
+            messages[0] = message;
+        }
+        Some(messages) => messages.insert(0, message),
+        None => body["messages"] = json!([message]),
+    }
+}
+
 fn model_failure(
     status: http::StatusCode,
     code: ErrorCode,
@@ -762,6 +956,11 @@ fn from_log(answer: &Event, session: &str) -> Answer {
             Err(serde_json::from_value(payload["error"].clone()).unwrap_or_else(unreadable))
         }
         Some(Outcome::NotRouted) => Err(not_routed(&answer.tool)),
+        Some(Outcome::Refused) if !payload["result"].is_null() => {
+            serde_json::from_value::<CallToolResult>(payload["result"].clone())
+                .map(CallToolResponse::from)
+                .map_err(unreadable)
+        }
         Some(Outcome::Refused) => Err(ErrorData::invalid_params(
             payload["reason"].as_str().unwrap_or("refused").to_owned(),
             None,

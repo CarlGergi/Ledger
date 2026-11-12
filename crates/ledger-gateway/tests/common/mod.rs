@@ -5,12 +5,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use ledger_gateway::ModelUpstream;
 use ledger_gateway::{Gateway, McpUpstream, Upstream};
-use ledger_store::{Event, EventKind, EventStore, Lease, NewEvent, SessionSummary, StoreError};
+use ledger_store::{
+    Event, EventKind, EventStore, Fork, Lease, NewEvent, PgEventStore, SessionSummary, StoreError,
+    ToolMode,
+};
 use ledger_testkit::PATIENCE;
+use ledger_testkit::TestDb;
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
 use ledger_tools::http::serve_mcp;
+use ledger_tools::model::Received;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
     PaginatedRequestParams, RequestMetaObject, ServerCapabilities, ServerConfig, Tool,
@@ -18,6 +24,8 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler};
+use sample_agent::{Conversation, connect, run_model_agent};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +45,20 @@ where
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     tokio::spawn(serve_mcp(handler, listener, CancellationToken::new()));
     url
+}
+
+/// Starts the scripted model on an ephemeral port: its base URL, up to `/v1`, and what it
+/// received.
+pub async fn spawn_model() -> (String, ledger_tools::model::Received) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let received = ledger_tools::model::Received::default();
+    tokio::spawn(ledger_tools::model::serve_model(
+        listener,
+        received.clone(),
+        CancellationToken::new(),
+    ));
+    (url, received)
 }
 
 /// Starts a gateway on an ephemeral port and returns its URL.
@@ -138,6 +160,14 @@ impl EventStore for FaultyStore {
 
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
         self.inner.sessions().await
+    }
+
+    async fn create_fork(&self, fork: &Fork) -> Result<(), StoreError> {
+        self.inner.create_fork(fork).await
+    }
+
+    async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError> {
+        self.inner.fork(session_id).await
     }
 }
 
@@ -258,4 +288,88 @@ where
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("condition was not met in time");
+}
+
+pub const REPORT: &str = "All good.";
+
+/// The scripted model and both tool servers behind one gateway, with one source run of
+/// `reporter-1` recorded in session `src`: model, write, model, send, model, ten events.
+pub struct Stack {
+    _db: TestDb,
+    pub store: Arc<dyn EventStore>,
+    pub mcp: String,
+    pub model: Received,
+    pub outbox: Arc<Outbox>,
+    _files: tempfile::TempDir,
+}
+
+impl Stack {
+    pub async fn start() -> Self {
+        let db = TestDb::new().await;
+        let store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(db.pool()));
+        let (model_url, model) = spawn_model().await;
+        let files = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(Outbox::new(files.path().join(".outbox.jsonl")));
+        let email = spawn_tool_server(EmailServer::new(outbox.clone())).await;
+        let file_server = spawn_tool_server(FileServer::new(files.path()).unwrap()).await;
+        let gateway = Gateway::new(
+            store.clone(),
+            vec![upstream("email", &email), upstream("files", &file_server)],
+            CALL_TIMEOUT,
+        )
+        .with_model(ModelUpstream::new(&model_url, None, PATIENCE));
+        let mcp = spawn_gateway(gateway).await;
+        let stack = Self {
+            _db: db,
+            store,
+            mcp,
+            model,
+            outbox,
+            _files: files,
+        };
+        let source = stack.run("src", REPORT).await.unwrap();
+        assert_eq!(source.answer, "Sent the daily report.");
+        assert_eq!(stack.events("src").await.len(), 10);
+        stack
+    }
+
+    /// The agent, run under `session` through the gateway, model calls included.
+    pub async fn run(&self, session: &str, report: &str) -> anyhow::Result<Conversation> {
+        let client = connect(&self.mcp, Some(session)).await?;
+        let gateway_v1 = format!("{}/v1", self.mcp.trim_end_matches("/mcp"));
+        run_model_agent(&client, &gateway_v1, Some(session), "reporter-1", report).await
+    }
+
+    pub async fn fork(&self, at_step: i64, model: Option<&str>, tools: ToolMode) -> String {
+        self.fork_with(at_step, model, None, tools).await
+    }
+
+    pub async fn fork_with(
+        &self,
+        at_step: i64,
+        model: Option<&str>,
+        system_prompt: Option<&str>,
+        tools: ToolMode,
+    ) -> String {
+        let session = format!("src.fork-{at_step}-{}", tools.as_str());
+        let fork = Fork {
+            session_id: session.clone(),
+            source_session: "src".into(),
+            at_step,
+            model: model.map(str::to_owned),
+            system_prompt: system_prompt.map(str::to_owned),
+            tools,
+        };
+        self.store.create_fork(&fork).await.unwrap();
+        session
+    }
+
+    pub async fn events(&self, session: &str) -> Vec<Event> {
+        self.store.session_events(session).await.unwrap()
+    }
+
+    /// Model calls the model actually received after the source run.
+    pub fn later_model_bodies(&self) -> Vec<Value> {
+        self.model.bodies()[3..].to_vec()
+    }
 }

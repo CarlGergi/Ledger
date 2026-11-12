@@ -6,30 +6,16 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{CALL_TIMEOUT, FaultyStore, Harness, spawn_gateway, spawn_tool_server, upstream};
+use common::{
+    CALL_TIMEOUT, FaultyStore, Harness, spawn_gateway, spawn_model, spawn_tool_server, upstream,
+};
 use ledger_gateway::{Gateway, ModelUpstream, error_codes};
 use ledger_store::{Event, EventKind, EventStore, NewEvent, Outcome, PgEventStore};
 use ledger_testkit::{PATIENCE, ReservedPort, TestDb};
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
-use ledger_tools::model::{Received, serve_model};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
-
-/// The scripted model, on an ephemeral port: its base URL and what it received.
-async fn spawn_model() -> (String, Received) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let received = Received::default();
-    tokio::spawn(serve_model(
-        listener,
-        received.clone(),
-        CancellationToken::new(),
-    ));
-    (url, received)
-}
 
 /// A gateway in front of the scripted model and no tools. Returns its base URL.
 async fn model_gateway(store: Arc<dyn EventStore>, model: ModelUpstream) -> String {

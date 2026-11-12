@@ -1,6 +1,7 @@
 //! The append-only event log: the record of every call that passes through Ledger.
 
 mod event;
+mod fork;
 mod memory;
 mod postgres;
 
@@ -9,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 pub use event::{Event, EventKind, NewEvent, Outcome, SessionSummary, args_hash};
+pub use fork::{Fork, ToolMode};
 pub use memory::MemoryStore;
 pub use postgres::{MIGRATOR, PgEventStore};
 
@@ -26,6 +28,9 @@ pub enum StoreError {
     Fenced,
     #[error("the session is owned by {owner} until its lease expires")]
     LeaseHeld { owner: String },
+    /// A fork was to start a session that already exists.
+    #[error("session {0:?} already exists, so it cannot become a fork")]
+    SessionExists(String),
 }
 
 /// The right to append to one session, until another owner takes it over.
@@ -70,4 +75,12 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Every call answered as in doubt, for a person to check, oldest first.
     async fn in_doubt(&self) -> Result<Vec<Event>, StoreError>;
+
+    /// Starts `fork.session_id` as a fork of `fork.source_session`, which must exist.
+    /// Fails with `SessionExists` if the session has already been started, as a fork or
+    /// by recording anything, so a session is a fork from its first event or never.
+    async fn create_fork(&self, fork: &Fork) -> Result<(), StoreError>;
+
+    /// The fork a session is, if it is one.
+    async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError>;
 }

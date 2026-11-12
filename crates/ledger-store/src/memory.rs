@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 
-use crate::{Event, EventKind, EventStore, Lease, NewEvent, Outcome, SessionSummary, StoreError};
+use crate::{
+    Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, SessionSummary, StoreError,
+};
 
 #[derive(Debug)]
 pub struct MemoryStore {
@@ -29,6 +31,7 @@ pub struct MemoryStore {
 struct State {
     sessions: BTreeMap<String, Session>,
     leases: BTreeMap<String, LeaseRow>,
+    forks: BTreeMap<String, Fork>,
 }
 
 #[derive(Debug)]
@@ -262,6 +265,40 @@ impl EventStore for MemoryStore {
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
         Ok(sessions)
+    }
+
+    async fn create_fork(&self, fork: &Fork) -> Result<(), StoreError> {
+        let now = self.now();
+        let mut state = self.state();
+        // CREATE_FORK: a session that already has a row inserts nothing, so this comes
+        // before any of the forks table's checks.
+        if state.sessions.contains_key(&fork.session_id) {
+            return Err(StoreError::SessionExists(fork.session_id.clone()));
+        }
+        // The checks and foreign keys of the sessions and forks tables.
+        if fork.session_id.is_empty() || fork.session_id == fork.source_session {
+            return Err(rejected("forks_check"));
+        }
+        if fork.at_step <= 0 {
+            return Err(rejected("forks_at_step_check"));
+        }
+        if fork.model.as_deref() == Some("") {
+            return Err(rejected("forks_model_check"));
+        }
+        if !state.sessions.contains_key(&fork.source_session) {
+            return Err(rejected("forks_source_session_fkey"));
+        }
+        let session = Session {
+            events: Vec::new(),
+            created_at: now,
+        };
+        state.sessions.insert(fork.session_id.clone(), session);
+        state.forks.insert(fork.session_id.clone(), fork.clone());
+        Ok(())
+    }
+
+    async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError> {
+        Ok(self.state().forks.get(session_id).cloned())
     }
 
     async fn in_doubt(&self) -> Result<Vec<Event>, StoreError> {

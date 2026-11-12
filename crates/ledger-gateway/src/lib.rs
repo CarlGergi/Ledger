@@ -4,6 +4,7 @@
 
 mod config;
 mod dedup;
+mod fork;
 mod gateway;
 mod model;
 mod policy;

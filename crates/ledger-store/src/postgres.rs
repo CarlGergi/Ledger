@@ -6,7 +6,10 @@ use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
-use crate::{Event, EventKind, EventStore, Lease, NewEvent, Outcome, SessionSummary, StoreError};
+use crate::{
+    Event, EventKind, EventStore, Fork, Lease, NewEvent, Outcome, SessionSummary, StoreError,
+    ToolMode,
+};
 
 pub static MIGRATOR: Migrator = sqlx::migrate!();
 
@@ -40,6 +43,19 @@ const ACQUIRE: &str = "
         WHERE leases.expires_at <= now() OR leases.owner = excluded.owner
     RETURNING token";
 
+// Claims the session's row and records the fork in one statement, so that the fork exists
+// before anything is recorded in its session, or not at all. A session that already has
+// a row inserts nothing, and the statement returns no row.
+const CREATE_FORK: &str = "
+    WITH claimed AS (
+        INSERT INTO sessions (session_id, last_seq) VALUES ($1, 0)
+        ON CONFLICT (session_id) DO NOTHING
+        RETURNING session_id
+    )
+    INSERT INTO forks (session_id, source_session, at_step, model, system_prompt, tools)
+    SELECT session_id, $2, $3, $4, $5, $6 FROM claimed
+    RETURNING session_id";
+
 #[derive(Debug, Clone)]
 pub struct PgEventStore {
     pool: PgPool,
@@ -67,6 +83,16 @@ impl PgEventStore {
         MIGRATOR.run(&self.pool).await.map_err(sqlx::Error::from)?;
         Ok(())
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct ForkRow {
+    session_id: String,
+    source_session: String,
+    at_step: i64,
+    model: Option<String>,
+    system_prompt: Option<String>,
+    tools: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -207,6 +233,43 @@ impl EventStore for PgEventStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Event::try_from).collect()
+    }
+
+    async fn create_fork(&self, fork: &Fork) -> Result<(), StoreError> {
+        let created: Option<(String,)> = sqlx::query_as(CREATE_FORK)
+            .bind(&fork.session_id)
+            .bind(&fork.source_session)
+            .bind(fork.at_step)
+            .bind(&fork.model)
+            .bind(&fork.system_prompt)
+            .bind(fork.tools.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        match created {
+            Some(_) => Ok(()),
+            None => Err(StoreError::SessionExists(fork.session_id.clone())),
+        }
+    }
+
+    async fn fork(&self, session_id: &str) -> Result<Option<Fork>, StoreError> {
+        let row: Option<ForkRow> = sqlx::query_as(
+            "SELECT session_id, source_session, at_step, model, system_prompt, tools
+             FROM forks WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            Ok(Fork {
+                session_id: r.session_id,
+                source_session: r.source_session,
+                at_step: r.at_step,
+                model: r.model,
+                system_prompt: r.system_prompt,
+                tools: ToolMode::parse(&r.tools)?,
+            })
+        })
+        .transpose()
     }
 
     async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {

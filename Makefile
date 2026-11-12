@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop vscode vscode-package soak demo stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop vscode vscode-package soak demo demo-model stack sessions log reproduce clean
 
 help:
 	@echo "make db-up      start PostgreSQL"

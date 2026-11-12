@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ledger_gateway::{Config, Gateway, McpUpstream, ModelUpstream, Upstream};
-use ledger_store::{Event, EventKind, EventStore, PgEventStore};
+use ledger_store::{Event, EventKind, EventStore, Fork, PgEventStore, ToolMode};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -46,6 +46,31 @@ enum Command {
     },
     /// List calls flagged for a person: they may have run, and are not safe to run again.
     InDoubt {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Start a session that replays another up to a step, then runs live. Prints its id:
+    /// run the agent again under that session, through the gateway.
+    Fork {
+        /// The session to fork.
+        source: String,
+        /// The source's event to go live at; calls requested before it are answered
+        /// from the source's log. One more than the source's last event replays it all.
+        #[arg(long)]
+        at: i64,
+        /// The model to ask once live, in place of the one the agent names.
+        #[arg(long)]
+        model: Option<String>,
+        /// A file whose text replaces the agent's system prompt once live.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
+        /// What tool calls do once live: `safe` answers calls the source made from its
+        /// log and runs only read-only ones, `replay` runs none, `live` runs them all.
+        #[arg(long, default_value = "safe", value_parser = ["safe", "replay", "live"])]
+        tools: String,
+        /// The new session's id. Defaults to `<source>.fork-<8 hex digits>`.
+        #[arg(long = "as")]
+        session: Option<String>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -91,6 +116,46 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Fork {
+            source,
+            at,
+            model,
+            system_prompt_file,
+            tools,
+            session,
+            database_url,
+        } => {
+            let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
+            let events = store.session_events(&source).await?;
+            anyhow::ensure!(!events.is_empty(), "no events for session {source:?}");
+            let last = events.len() as i64;
+            anyhow::ensure!(
+                (1..=last + 1).contains(&at),
+                "--at must be from 1 to {}: session {source:?} has {last} events",
+                last + 1
+            );
+            let system_prompt = system_prompt_file
+                .map(|path| {
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))
+                })
+                .transpose()?;
+            let session = session.unwrap_or_else(|| {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                format!("{source}.fork-{}", &id[..8])
+            });
+            let fork = Fork {
+                session_id: session.clone(),
+                source_session: source,
+                at_step: at,
+                model,
+                system_prompt,
+                tools: ToolMode::parse(&tools)?,
+            };
+            store.create_fork(&fork).await?;
+            println!("{session}");
+            Ok(())
+        }
         Command::Log {
             session,
             database_url,
@@ -98,7 +163,23 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let store = PgEventStore::connect(&database_url, READ_TIMEOUT).await?;
             let events = store.session_events(&session).await?;
-            anyhow::ensure!(!events.is_empty(), "no events for session {session:?}");
+            let fork = store.fork(&session).await?;
+            if let (Some(fork), false) = (&fork, json) {
+                println!(
+                    "fork of {} at step {}, tools {}{}",
+                    fork.source_session,
+                    fork.at_step,
+                    fork.tools.as_str(),
+                    fork.model
+                        .as_ref()
+                        .map(|m| format!(", model {m}"))
+                        .unwrap_or_default()
+                );
+            }
+            anyhow::ensure!(
+                !events.is_empty() || fork.is_some(),
+                "no events for session {session:?}"
+            );
             for event in &events {
                 if json {
                     println!("{}", serde_json::to_string(event)?);
@@ -171,6 +252,15 @@ fn summary(event: &Event) -> String {
             format!("response to #{request} ({})", outcome.as_str())
         }
         (EventKind::CallRetry, Some(request), None) => format!("retry of #{request}"),
+        _ if !event.payload["replayed_from"].is_null() => {
+            let from = &event.payload["replayed_from"];
+            let what = match event.kind {
+                EventKind::ModelRequest => "model request",
+                _ => "request",
+            };
+            let source = from["session"].as_str().unwrap_or_default();
+            format!("{what}, replayed from {source} #{}", from["seq"])
+        }
         (EventKind::ModelRequest, _, _) => "model request".to_owned(),
         _ => match event.payload["effect"]["class"].as_str() {
             Some(class) => format!("request ({class})"),

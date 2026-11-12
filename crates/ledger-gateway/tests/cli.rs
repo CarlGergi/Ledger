@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::{Probe, eventually, spawn_tool_server};
-use ledger_store::{EventKind, EventStore, Outcome, PgEventStore};
+use ledger_store::{EventKind, EventStore, NewEvent, Outcome, PgEventStore, ToolMode};
 use ledger_testkit::{PATIENCE, ReservedPort, TestDb};
 use ledger_tools::email::{EmailServer, Outbox};
 use ledger_tools::files::FileServer;
@@ -297,4 +297,69 @@ fn a_bad_config_stops_the_binary_with_a_useful_message() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("/nonexistent/ledger.toml"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fork_command_starts_a_fork_that_the_log_names() {
+    let db = TestDb::new().await;
+    let store = PgEventStore::new(db.pool());
+    let lease = store.acquire_lease("src", "test", PATIENCE).await.unwrap();
+    for _ in 0..2 {
+        let request = NewEvent::request("src", "t", &json!({}), json!({}));
+        store.append(request, &lease).await.unwrap();
+    }
+    let db_url = db.url();
+    let prompt = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(prompt.path(), "Be brief.").unwrap();
+
+    let (ok, named) = ledger_output(
+        &[
+            "fork",
+            "src",
+            "--at",
+            "3",
+            "--model",
+            "m2",
+            "--tools",
+            "replay",
+            "--as",
+            "f1",
+            "--system-prompt-file",
+            prompt.path().to_str().unwrap(),
+        ],
+        db_url,
+    );
+    assert!(ok);
+    assert_eq!(named, "f1\n");
+    let fork = store.fork("f1").await.unwrap().unwrap();
+    assert_eq!((fork.at_step, fork.model.as_deref()), (3, Some("m2")));
+    assert_eq!(fork.system_prompt.as_deref(), Some("Be brief."));
+    assert_eq!(fork.tools, ToolMode::Replay);
+
+    let (ok, generated) = ledger_output(&["fork", "src", "--at", "1"], db_url);
+    assert!(ok);
+    assert!(generated.trim().starts_with("src.fork-"), "{generated}");
+    assert_eq!(
+        store.fork(generated.trim()).await.unwrap().unwrap().tools,
+        ToolMode::Safe
+    );
+
+    let (ok, log) = ledger_output(&["log", "f1"], db_url);
+    assert!(ok);
+    assert_eq!(log, "fork of src at step 3, tools replay, model m2\n");
+
+    let refused = |args: &[&str]| {
+        let output = Command::new(LEDGER)
+            .args(args)
+            .env("DATABASE_URL", db_url)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        String::from_utf8(output.stderr).unwrap()
+    };
+    assert!(refused(&["fork", "src", "--at", "4"]).contains("from 1 to 3"));
+    assert!(refused(&["fork", "src", "--at", "0"]).contains("from 1 to 3"));
+    assert!(refused(&["fork", "missing", "--at", "1"]).contains("no events"));
+    assert!(refused(&["fork", "src", "--at", "1", "--as", "f1"]).contains("already exists"));
+    assert!(refused(&["fork", "src", "--at", "1", "--tools", "all"]).contains("safe"));
 }

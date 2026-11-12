@@ -30,6 +30,7 @@ LEASES = "crates/ledger-store/migrations/0002_leases.sql"
 RETRIES = "crates/ledger-store/migrations/0003_retries.sql"
 MODEL_CALLS = "crates/ledger-store/migrations/0004_model_calls.sql"
 MODEL = "crates/ledger-gateway/src/model.rs"
+FORK = "crates/ledger-gateway/src/fork.rs"
 EVENT = "crates/ledger-store/src/event.rs"
 MEMORY = "crates/ledger-store/src/memory.rs"
 SIM_TEST = "the_first_seeds_keep_every_invariant"
@@ -546,7 +547,7 @@ FAULTS = [
         "model: the model is asked before the request is logged",
         "a_model_call_that_cannot_be_logged_is_not_sent",
         GATEWAY,
-        [("        let seq = match self.append(request).await {\n            Ok(event) => event.seq,", "        let _early = upstream.send(&call.body, &call.credentials).await;\n        let seq = match self.append(request).await {\n            Ok(event) => event.seq,")],
+        [("        let seq = self.append(request).await.map_err(not_recorded)?.seq;\n        drop(guard);", "        let _early = upstream.send(&sent, &call.credentials).await;\n        let seq = self.append(request).await.map_err(not_recorded)?.seq;\n        drop(guard);")],
     ),
     Fault(
         "model: a reply reaches the agent though it was not logged",
@@ -558,7 +559,7 @@ FAULTS = [
         "model: the agent's key is logged",
         "credentials_reach_the_model_but_never_the_log",
         GATEWAY,
-        [("        let payload = json!({ \"request\": call.body });", "        let payload = json!({ \"request\": call.body, \"auth\": format!(\"{:?}\", call.credentials) });")],
+        [("        let mut payload = json!({ \"request\": call.body });", "        let mut payload = json!({ \"request\": call.body, \"auth\": format!(\"{:?}\", call.credentials) });")],
     ),
     Fault(
         "model: every header the agent sent is passed on",
@@ -607,6 +608,78 @@ FAULTS = [
         "the_schema_refuses_malformed_model_calls",
         MEMORY,
         [("event.kind.is_request() != event.args_hash.is_some()", "(event.kind == EventKind::CallRequest && event.args_hash.is_none())")],
+    ),
+    Fault(
+        "fork: calls before the fork step run instead of replaying",
+        "a_fork_past_the_end_replays_the_whole_run_and_runs_nothing",
+        FORK,
+        [("    if before.peek().is_some() {", "    if before.peek().is_some() && fork.at_step < 0 {")],
+    ),
+    Fault(
+        "fork: a call that went another way before the fork step is let through",
+        "a_fork_whose_agent_goes_another_way_before_the_step_is_refused",
+        FORK,
+        [("            None => Replay::Diverged(format!(", "            None if fork.at_step > 0 => return Replay::Live,\n            None => Replay::Diverged(format!(")],
+    ),
+    Fault(
+        "fork: a source call can answer more than once",
+        "a_fork_goes_live_at_its_step_on_the_new_model_and_runs_no_new_effects",
+        FORK,
+        [("        .filter_map(|e| e.payload[\"replayed_from\"][\"seq\"].as_i64())", "        .filter_map(|e| e.payload[\"replayed_from\"][\"seq\"].as_i64().filter(|_| false))")],
+    ),
+    Fault(
+        "fork: safe mode runs a tool with effects",
+        "a_fork_goes_live_at_its_step_on_the_new_model_and_runs_no_new_effects",
+        FORK,
+        [("        (None, ToolMode::Safe) if asked.read_only => Replay::Live,", "        (None, ToolMode::Safe) => Replay::Live,")],
+    ),
+    Fault(
+        "fork: replay mode runs a read",
+        "in_replay_mode_nothing_new_runs_not_even_a_read",
+        FORK,
+        [("        (None, ToolMode::Safe) if asked.read_only => Replay::Live,", "        (None, ToolMode::Safe | ToolMode::Replay) if asked.read_only => Replay::Live,")],
+    ),
+    Fault(
+        "fork: live mode answers from the log instead of running",
+        "in_live_mode_a_fork_runs_its_tool_calls_for_real",
+        FORK,
+        [("    if asked.kind == EventKind::ModelRequest || fork.tools == ToolMode::Live {", "    if asked.kind == EventKind::ModelRequest {")],
+    ),
+    Fault(
+        "fork: the fork's model is not used",
+        "a_fork_goes_live_at_its_step_on_the_new_model_and_runs_no_new_effects",
+        GATEWAY,
+        [("                        sent[\"model\"] = json!(model);", "                        let _ = model;")],
+    ),
+    Fault(
+        "fork: the fork's system prompt is not used",
+        "a_new_system_prompt_is_sent_and_logged_beside_the_agents_request",
+        GATEWAY,
+        [("                        set_system_prompt(&mut sent, prompt);", "                        let _ = prompt;")],
+    ),
+    Fault(
+        "fork: a live model call is hashed as sent, not as the agent asked",
+        "a_new_system_prompt_is_sent_and_logged_beside_the_agents_request",
+        GATEWAY,
+        [("        let request = NewEvent::model_request(session, &name, &call.body, payload);", "        let request = NewEvent::model_request(session, &name, &sent, payload);")],
+    ),
+    Fault(
+        "fork: the gateway forgets that a session is a fork",
+        "a_fork_past_the_end_replays_the_whole_run_and_runs_nothing",
+        GATEWAY,
+        [("                forks.entry(session).or_insert(None);", "                forks.insert(session, None);")],
+    ),
+    Fault(
+        "fork: a started session can become a fork",
+        "a_fork_cannot_take_a_started_session_or_name_a_missing_source",
+        STORE,
+        [("        ON CONFLICT (session_id) DO NOTHING", "        ON CONFLICT (session_id) DO UPDATE SET last_seq = sessions.last_seq")],
+    ),
+    Fault(
+        "conformance: the memory store lets a started session become a fork",
+        "a_fork_cannot_take_a_started_session_or_name_a_missing_source",
+        MEMORY,
+        [("        if state.sessions.contains_key(&fork.session_id) {\n            return Err(StoreError::SessionExists", "        if state.sessions.contains_key(&fork.session_id) && fork.at_step < 0 {\n            return Err(StoreError::SessionExists")],
     ),
 ]
 
@@ -679,7 +752,10 @@ def copy_source(copy: Path) -> None:
         text=True,
         check=True,
     ).stdout
-    for name in filter(None, listed.split("\0")):
+    names = list(filter(None, listed.split("\0")))
+    if not names:
+        sys.exit(f"git lists no files under {ROOT}: is it a git work tree of its own?")
+    for name in names:
         source = ROOT / name
         if source.is_file():
             (copy / name).parent.mkdir(parents=True, exist_ok=True)

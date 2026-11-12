@@ -26,12 +26,12 @@ jobs:
       DATABASE_URL: postgres://ledger:ledger@127.0.0.1:5432/ledger
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup toolchain install 1.99 --profile minimal --component rustfmt,clippy
           rustup default 1.99
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -46,7 +46,7 @@ jobs:
         run: cargo test --workspace --locked
       - name: Simulate
         run: cargo run --release --locked -p ledger-sim -- --seeds 10000
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: VS Code extension
