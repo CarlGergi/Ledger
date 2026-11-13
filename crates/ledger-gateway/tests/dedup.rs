@@ -70,6 +70,88 @@ async fn faulty_harness(db: &TestDb) -> (Arc<FaultyStore>, Arc<dyn EventStore>, 
     (faulty, real, harness)
 }
 
+/// An MCP client over HTTP that numbers its own requests, so that it can send one again
+/// with the same JSON-RPC id over the same connection, as an agent does when an answer is
+/// lost. The SDK's client numbers requests itself and never sends one twice.
+struct RawAgent {
+    http: reqwest::Client,
+    url: String,
+    session: String,
+    transport: Option<String>,
+}
+
+impl RawAgent {
+    async fn connect(url: &str, session: &str) -> Self {
+        let mut agent = Self {
+            http: reqwest::Client::new(),
+            url: url.to_owned(),
+            session: session.to_owned(),
+            transport: None,
+        };
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "raw", "version": "1"},
+            },
+        });
+        let response = agent.send(&initialize).await;
+        let transport = response.headers()["mcp-session-id"].to_str().unwrap();
+        agent.transport = Some(transport.to_owned());
+        message(response).await;
+        let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        agent.send(&initialized).await;
+        agent
+    }
+
+    async fn send(&self, body: &Value) -> reqwest::Response {
+        let mut request = self
+            .http
+            .post(&self.url)
+            .header("accept", "application/json, text/event-stream")
+            .header("x-ledger-session", &self.session)
+            .json(body);
+        if let Some(transport) = &self.transport {
+            request = request
+                .header("mcp-session-id", transport)
+                .header("mcp-protocol-version", "2025-06-18");
+        }
+        let response = request.send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+        response
+    }
+
+    /// Calls a tool under the given JSON-RPC id, and returns the result.
+    async fn call(&self, id: u64, params: &CallToolRequestParams) -> Value {
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params});
+        let answer = message(self.send(&body).await).await;
+        assert_eq!(answer["id"], id, "{answer}");
+        answer["result"].clone()
+    }
+}
+
+/// The last JSON-RPC message in a response, whether sent as JSON or as an event stream.
+async fn message(response: reqwest::Response) -> Value {
+    let json = response
+        .headers()
+        .get("content-type")
+        .is_some_and(|t| t.as_bytes().starts_with(b"application/json"));
+    let body = response.text().await.unwrap();
+    if json {
+        return serde_json::from_str(&body).unwrap();
+    }
+    let data = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .rfind(|data| !data.is_empty())
+        .unwrap_or_else(|| panic!("no message in {body:?}"));
+    serde_json::from_str(data).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retried_step_is_answered_from_the_log_and_runs_once() {
     let db = TestDb::new().await;
@@ -127,6 +209,32 @@ async fn identical_calls_without_a_step_all_run() {
     // Identical arguments alone never make a retry: the agent may mean both.
     assert_eq!(read(&harness, "log.txt").await, "xx");
     assert_eq!(harness.outbox.sent().await.unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resent_id_is_a_retry_even_after_another_call_on_the_connection() {
+    let db = TestDb::new().await;
+    let store = pg(&db);
+    let harness = Harness::start(store.clone()).await;
+    let agent = RawAgent::connect(&harness.url, "s").await;
+
+    let first = agent.call(5, &append("x")).await;
+    agent.call(6, &append("y")).await;
+    // The answer to 5 was lost, and the agent sends it again after 6.
+    let again = agent.call(5, &append("x")).await;
+
+    assert_eq!(again, first);
+    assert_eq!(read(&harness, "log.txt").await, "xy");
+    assert_eq!(
+        shape(&store).await,
+        [
+            (EventKind::CallRequest, None, None),
+            (EventKind::CallResponse, Some(1), Some(Outcome::Ok)),
+            (EventKind::CallRequest, None, None),
+            (EventKind::CallResponse, Some(3), Some(Outcome::Ok)),
+            (EventKind::CallRetry, Some(1), None),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

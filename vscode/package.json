@@ -4,7 +4,7 @@
   "description": "Browse, inspect and replay the sessions Ledger recorded.",
   "version": "0.1.0",
   "publisher": "ledger",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "engines": {
     "vscode": "^1.99.0"

@@ -286,10 +286,9 @@ def takeover(out):
 
 
 def screenshots():
-    for source, target in ((RESULTS / "email-demo" / "mailpit-inbox.png", "mailpit-inbox.png"),
-                           (RESULTS / "azure" / "insights.png", "azure-insights.png")):
-        if source.exists():
-            shutil.copyfile(source, IMAGES / target)
+    source = RESULTS / "email-demo" / "mailpit-inbox.png"
+    if source.exists():
+        shutil.copyfile(source, IMAGES / "mailpit-inbox.png")
 
 
 def main():

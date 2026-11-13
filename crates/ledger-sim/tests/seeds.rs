@@ -54,6 +54,7 @@ fn the_runs_exercise_every_fault() {
         "duplicated to",
         "network: answer to",
         "refused: the session has been taken over",
+        "resent late",
     ] {
         assert!(
             trace.iter().any(|line| line.contains(fault)),

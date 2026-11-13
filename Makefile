@@ -1,4 +1,4 @@
-.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local demo-email azure-check bench-duplicates bench-overhead bench-takeover stack sessions log reproduce clean
+.PHONY: help db-up db-down db-reset lint test breakage simulate interop regress vscode vscode-package soak demo demo-model demo-agentmail agentmail-local demo-email azure-check bench-duplicates bench-overhead bench-takeover screens stack sessions log reproduce clean
 
 # The development database (docker compose), unless one is named. Binaries run directly,
 # not through cargo, need it from here.
@@ -11,7 +11,7 @@ help:
 	@echo "make db-reset   delete all recorded sessions and test leftovers"
 	@echo "make lint       check formatting and run clippy"
 	@echo "make test       run every test"
-	@echo "make breakage   break each guarantee and check that a test notices"
+	@echo "make breakage   break each guarantee and check that a test notices, about 3.5 hours; not part of reproduce"
 	@echo "make simulate   run 10,000 seeds of the deterministic simulation"
 	@echo "make interop    drive the gateway with the official TypeScript MCP client"
 	@echo "make vscode     type-check and test the VS Code extension"
@@ -28,7 +28,8 @@ help:
 	@echo "make sessions   list recorded sessions"
 	@echo "make log SESSION=<id>  print a session's events"
 	@echo "make azure-check  compile the Azure templates (needs the Azure CLI); creates nothing"
-	@echo "make reproduce  run all of the above checks"
+	@echo "make screens    record demo sessions and capture the VS Code screenshots in docs/images; opens VS Code"
+	@echo "make reproduce  rebuild every number in the README and run the test suite"
 
 db-up:
 	docker compose up -d --wait
@@ -108,6 +109,9 @@ azure-check:
 		az bicep build --file deploy/azure/$$template.bicep --stdout >/dev/null || exit 1; done
 	@echo "the Azure templates compile"
 
+screens: db-up
+	scripts/vscode-screens.sh
+
 bench-takeover: db-up
 	cargo build --quiet --release -p ledger-gateway -p ledger-bench
 	mkdir -p results
@@ -128,7 +132,7 @@ sessions:
 log:
 	cargo run --quiet --package ledger-gateway --bin ledger -- log $(SESSION)
 
-reproduce: lint test breakage simulate interop regress demo-email agentmail-local bench-duplicates bench-takeover vscode
+reproduce: lint test simulate interop regress demo-email agentmail-local bench-duplicates bench-takeover vscode
 
 clean:
 	cargo clean

@@ -1,54 +1,52 @@
 //! Local ports. The MCP HTTP client opens a connection per request, so a benchmark making
 //! thousands of calls can run out of local ports to one address.
 
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
-fn time_wait() -> usize {
-    std::process::Command::new("netstat")
-        .args(["-an", "-p", "tcp"])
+/// All TCP sockets on the machine, TIME_WAIT included, from a macOS sysctl cheap enough to
+/// read before every call. None where it cannot be read. Not netstat: started from a
+/// program rather than a shell, it printed nothing on the Mac these ran on, and a count
+/// of zero let every wait pass at once.
+fn sockets() -> Option<usize> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "net.inet.tcp.pcbcount"])
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.contains("TIME_WAIT"))
-                .count()
-        })
-        .unwrap_or(0)
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-async fn wait_below(limit: usize) {
+/// Waits while the machine holds more than `limit` TCP sockets, for at most two minutes.
+/// Says so, once, if it cannot count them, rather than pretending there are none.
+async fn wait_below(limit: usize, poll: Duration) {
+    static UNCOUNTED: Once = Once::new();
     let deadline = Instant::now() + Duration::from_secs(120);
-    while time_wait() > limit && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    loop {
+        let Some(count) = sockets() else {
+            UNCOUNTED.call_once(|| {
+                eprintln!("cannot count TCP sockets here, so not waiting for local ports")
+            });
+            return;
+        };
+        if count <= limit || Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(poll).await;
     }
 }
 
-/// Waits until few sockets are left in TIME_WAIT. The MCP HTTP client opens a connection
-/// per request, and macOS keeps each closed one for about 30 seconds, so phases run back
-/// to back would run out of the ~16,000 local ports. Gives up waiting after two minutes.
+/// Waits until few sockets are left, TIME_WAIT included. The MCP HTTP client opens a
+/// connection per request, and macOS keeps each closed one for about 30 seconds, so
+/// phases run back to back would run out of the ~16,000 local ports.
 pub async fn let_ports_drain() {
-    wait_below(1000).await;
-}
-
-/// All TCP sockets on the machine, TIME_WAIT included: a sysctl, cheap enough to read
-/// before every call, where netstat takes a fraction of a second.
-fn sockets() -> usize {
-    std::process::Command::new("sysctl")
-        .args(["-n", "net.inet.tcp.pcbcount"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0)
+    wait_below(1000, Duration::from_secs(1)).await;
 }
 
 /// Waits while the machine holds more than 8,000 TCP sockets, half its ~16,000 local
-/// ports: for pacing a run that opens connections faster than they drain. Gives up
-/// waiting after two minutes; a run that still runs out is then refused, not counted.
+/// ports: for pacing a run that opens connections faster than they drain. A run that
+/// still runs out is then refused, not counted.
 pub async fn keep_ports_free() {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while sockets() > 8000 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    wait_below(8000, Duration::from_millis(200)).await;
 }
 
 /// Whether an error is the machine running out of local ports (EADDRNOTAVAIL), not

@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Shared with the other benchmarks; this one uses only part of it.
+#[allow(dead_code)]
 mod ports;
 
 use clap::Parser;
@@ -170,7 +172,8 @@ async fn run(args: &Args, arrangement: Arrangement, tool: Tool) -> anyhow::Resul
         Tool::Append => ("append_file", Result::default()),
     };
     let url = format!("{agent_url}/mcp");
-    ports::let_ports_drain().await;
+    // Pacing before every call, below, is what keeps local ports free: the counts do not
+    // depend on how many sockets the last run left behind.
     let mut agent = RetryingAgent::new(&url, session);
     for i in 0..args.calls {
         let arguments = match tool {

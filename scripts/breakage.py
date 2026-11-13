@@ -440,9 +440,17 @@ FAULTS = [
     ),
     Fault(
         "dedup: identical arguments alone make a retry",
-        "identical_calls_without_a_step_all_run",
+        "identical_arguments_alone_never_make_a_retry",
         DEDUP,
         [("&& &e.payload[\"rpc_id\"] == call.rpc_id", "|| true")],
+    ),
+    # The gateway checks the id again, so this shows only when another call on the same
+    # connection comes between a call and its retry.
+    Fault(
+        "lookup: a retry by id is found whatever the id",
+        "a_resent_id_is_a_retry_even_after_another_call_on_the_connection",
+        STORE,
+        [("      AND ask_transport = $2 AND ask_rpc_id = $3\n", "      AND ask_transport = $2 AND (ask_rpc_id = $3 OR $3 IS NOT NULL)\n")],
     ),
     Fault(
         "dedup: a step reused for other arguments is accepted",
@@ -557,7 +565,7 @@ FAULTS = [
         "model: the model is asked before the request is logged",
         "a_model_call_that_cannot_be_logged_is_not_sent",
         GATEWAY,
-        [("        let seq = self.append(request).await.map_err(not_recorded)?.seq;\n        drop(guard);", "        let _early = upstream.send(&sent, &call.credentials).await;\n        let seq = self.append(request).await.map_err(not_recorded)?.seq;\n        drop(guard);")],
+        [("        let seq = self.append(request).await.map_err(not_recorded)?.seq;\n        drop(guard);", "        let _early = upstream.send(&sent, &call.credentials, None).await;\n        let seq = self.append(request).await.map_err(not_recorded)?.seq;\n        drop(guard);")],
     ),
     Fault(
         "model: a reply reaches the agent though it was not logged",
@@ -610,7 +618,7 @@ FAULTS = [
     Fault(
         "model: the schema lets a model request go unhashed",
         "the_schema_refuses_malformed_model_calls",
-        MODEL_CALLS,
+        CALL_LOOKUP,
         [("        CHECK ((kind IN ('call_request', 'model_request')) = (args_hash IS NOT NULL)) NOT VALID;", "        CHECK ((kind = 'call_request') = (args_hash IS NOT NULL) OR kind = 'model_request') NOT VALID;")],
     ),
     Fault(
@@ -883,6 +891,14 @@ FAULTS = [
         LOOKUP,
         [("            e.payload[\"transport\"].as_str() == Some(transport.as_str())", "            (e.payload[\"transport\"].as_str() == Some(transport.as_str()) || true)")],
     ),
+    # The same break as "a retry by id is found whatever the id", in the store the
+    # simulator runs on, where late resends show it.
+    Fault(
+        "conformance: the memory store's lookup ignores the id",
+        SIM_TEST,
+        LOOKUP,
+        [("                && e.payload.get(\"rpc_id\") == Some(&key.rpc_id)", "                && (e.payload.get(\"rpc_id\") == Some(&key.rpc_id) || true)")],
+    ),
     Fault(
         "smtp: a repeated key sends the email again",
         "a_repeated_key_returns_the_first_message_and_sends_nothing",
@@ -1047,7 +1063,8 @@ def main() -> int:
         for fault in FAULTS:
             print(f"{fault.name}\n    caught by {fault.caught_by}")
         return 0
-    faults = [f for f in FAULTS if not args or args[0] in f.name]
+    # Any number of filters: a fault runs if its name contains one of them.
+    faults = [f for f in FAULTS if not args or any(a in f.name for a in args)]
 
     with tempfile.TemporaryDirectory(prefix="ledger-breakage-") as temp:
         copy = Path(temp) / "src"

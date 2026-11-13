@@ -211,12 +211,15 @@ def main() -> int:
         if subprocess.run(build, cwd=ROOT, env=own_build(instance)).returncode != 0:
             return 1
 
+    started = time.monotonic()
     results = []
     for condition in conditions:
         print(f"{condition.name}...", flush=True)
         results.append(soak(condition, args.scale))
+    minutes = (time.monotonic() - started) / 60
 
-    print(f"\nMachine: {machine()}\n")
+    print(f"\nMachine: {machine()}")
+    print(f"Scale {args.scale:g}, {sum(len(r.seconds) for r in results)} suite runs in {minutes:.0f} minutes\n")
     print_table(results)
 
     failures = sum(r.failures for r in results)

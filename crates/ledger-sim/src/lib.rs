@@ -39,6 +39,9 @@ const SETTLE: Duration = Duration::from_secs(30);
 const DROP_REQUEST: f64 = 0.03;
 const DUPLICATE_REQUEST: f64 = 0.03;
 const DROP_ANSWER: f64 = 0.03;
+/// For an agent that resends by id, the chance of sending its previous call again after
+/// the next one, as a retry timer that fires late does.
+const LATE_RESEND: f64 = 0.2;
 
 /// The outcome of one seed.
 #[derive(Debug)]
@@ -237,7 +240,8 @@ async fn chaos(cluster: Arc<Cluster>, done: Arc<AtomicBool>) {
 pub enum Kind {
     /// Numbers its steps, and reconnects to retry, with a new transport session and ids.
     Stepped,
-    /// Resends with the same JSON-RPC id over the same transport session.
+    /// Resends with the same JSON-RPC id over the one transport session it keeps for all
+    /// its calls, sometimes late, after its next call.
     SameId,
     /// Resends with a new id and no step, which ledger cannot tell from a new call.
     NewId,
@@ -273,9 +277,15 @@ impl Agent {
     }
 
     async fn run(self, world: World, cluster: Arc<Cluster>) {
+        // An agent that resends by id keeps one transport session for all its calls.
+        let connection =
+            (self.kind == Kind::SameId).then(|| format!("{}-t{}", self.session, world.next_id()));
+        let mut previous: Option<(Value, &str, &str)> = None;
         for (tool, intent) in &self.intents {
             let mut id = json!(world.next_id());
-            let mut transport = format!("{}-t{}", self.session, world.next_id());
+            let mut transport = connection
+                .clone()
+                .unwrap_or_else(|| format!("{}-t{}", self.session, world.next_id()));
             let step = (self.kind == Kind::Stepped).then(|| intent.clone());
             for attempt in 1..=ATTEMPTS {
                 match self.kind {
@@ -324,16 +334,9 @@ impl Agent {
                     continue;
                 }
                 world.note(format!("{tag}: {}", describe(&answer)));
-                let seen = match &answer {
-                    Ok(result) => {
-                        let result = rmcp::model::ServerResult::from(result.clone());
-                        Ok(serde_json::to_value(result).expect("serialisable"))
-                    }
-                    Err(error) => Err(error.code.0),
-                };
                 world.state().seen.push(Seen {
                     intent: intent.clone(),
-                    answer: seen,
+                    answer: told(&answer),
                 });
                 let try_again = match &answer {
                     Ok(_) => false,
@@ -352,7 +355,45 @@ impl Agent {
                     break;
                 }
             }
+
+            // A retry that fires after the agent has moved on: the previous call again,
+            // under its own id, on the same connection, with this call in between.
+            if let Some((late_id, late_tool, late_intent)) = previous.take()
+                && world.chance(LATE_RESEND)
+            {
+                let (life, copy) = cluster.pick();
+                world.note(format!("{late_intent} resent late to {}", life.name));
+                let late = arrival(
+                    &self.session,
+                    &transport,
+                    late_id,
+                    None,
+                    late_tool,
+                    late_intent,
+                );
+                if let Ok(answer) = tokio::time::timeout(AGENT_PATIENCE, copy.call(late)).await {
+                    world.note(format!("{late_intent} resent late: {}", describe(&answer)));
+                    world.state().seen.push(Seen {
+                        intent: late_intent.to_owned(),
+                        answer: told(&answer),
+                    });
+                }
+            }
+            if connection.is_some() {
+                previous = Some((id, tool, intent));
+            }
         }
+    }
+}
+
+/// An answer as the checks compare it with the log: the result as sent, or the error code.
+fn told(answer: &Result<rmcp::model::CallToolResponse, rmcp::ErrorData>) -> Result<Value, i32> {
+    match answer {
+        Ok(result) => {
+            let result = rmcp::model::ServerResult::from(result.clone());
+            Ok(serde_json::to_value(result).expect("serialisable"))
+        }
+        Err(error) => Err(error.code.0),
     }
 }
 
