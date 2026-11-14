@@ -46,6 +46,9 @@ STORE = "crates/ledger-store/src/postgres.rs"
 PORT = "crates/ledger-testkit/src/port.rs"
 UPSTREAM = "crates/ledger-gateway/src/upstream.rs"
 TEST_TIMEOUT_SECS = 1800
+# Test databases made by this check's runs are named with this tag (ledger-testkit's
+# LEDGER_TEST_DB_TAG), so that the ones a broken run leaves can be dropped, and only those.
+DB_TAG = "breakage"
 
 
 @dataclass
@@ -959,9 +962,35 @@ FAULTS = [
 ]
 
 
+def psql(sql: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "ledger", "-d", "ledger", "-Atc", sql],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+
+def drop_own_databases() -> None:
+    """Drops the test databases this check's runs left behind. A faulty build often fails
+    before a test can drop its own, and a run killed on its timeout never gets the chance;
+    left there, they pile up by the hundred on the development server."""
+    listed = psql(f"SELECT datname FROM pg_database WHERE datname LIKE 'ledger\\_test\\_{DB_TAG}\\_%'")
+    if listed.returncode != 0:
+        print(f"could not list leftover test databases: {listed.stderr.strip()}", flush=True)
+        return
+    names = listed.stdout.split()
+    for name in names:
+        dropped = psql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        if dropped.returncode != 0:
+            print(f"could not drop {name}: {dropped.stderr.strip()}", flush=True)
+    if names:
+        print(f"        dropped {len(names)} test databases the run left behind", flush=True)
+
+
 def run_tests(copy: Path) -> tuple[bool, dict[str, str], str]:
     """Returns whether the suite finished, each failed test's panic, and any compile error."""
-    env = dict(os.environ, CARGO_TARGET_DIR=str(ROOT / "target" / "breakage"))
+    env = dict(os.environ, CARGO_TARGET_DIR=str(ROOT / "target" / "breakage"), LEDGER_TEST_DB_TAG=DB_TAG)
     # In a process group of its own, so that a timeout also ends the test binaries, which
     # would otherwise carry on by themselves, holding their databases.
     tests = subprocess.Popen(
@@ -979,6 +1008,8 @@ def run_tests(copy: Path) -> tuple[bool, dict[str, str], str]:
         os.killpg(tests.pid, signal.SIGKILL)
         tests.wait()
         return False, {}, ""
+    finally:
+        drop_own_databases()
     failed = dict.fromkeys(re.findall(r"^test (\S+) \.\.\. FAILED", output, re.M), "")
     for name, panic in re.findall(r"^thread '([^']+)'[^\n]* panicked at [^\n]*\n([^\n]*)", output, re.M):
         if name in failed:
@@ -1066,6 +1097,8 @@ def main() -> int:
     # Any number of filters: a fault runs if its name contains one of them.
     faults = [f for f in FAULTS if not args or any(a in f.name for a in args)]
 
+    # Whatever an interrupted earlier check left.
+    drop_own_databases()
     with tempfile.TemporaryDirectory(prefix="ledger-breakage-") as temp:
         copy = Path(temp) / "src"
         copy_source(copy)

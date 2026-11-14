@@ -22,6 +22,25 @@ use uuid::Uuid;
 
 const POOL_SIZE: u32 = 5;
 
+/// Set by a tool that runs the suite over and over, such as the breakage check, so that it
+/// can drop the databases its runs leave behind (a test killed on a timeout cannot drop its
+/// own) without touching any other run's.
+pub const TAG_VAR: &str = "LEDGER_TEST_DB_TAG";
+
+/// `ledger_test_` and a random part, with the tag in between when there is one.
+fn database_name(tag: Option<&str>) -> String {
+    let id = Uuid::new_v4().simple();
+    let Some(tag) = tag else {
+        return format!("ledger_test_{id}");
+    };
+    let safe = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+    assert!(
+        (1..=16).contains(&tag.len()) && tag.bytes().all(safe),
+        "{TAG_VAR} must be 1 to 16 lowercase letters, digits or underscores, not {tag:?}"
+    );
+    format!("ledger_test_{tag}_{id}")
+}
+
 /// A migrated database that is dropped when this value goes out of scope, even if the
 /// test panicked. Declare it first in a test, so that it is dropped last.
 pub struct TestDb {
@@ -36,7 +55,7 @@ impl TestDb {
     pub async fn new() -> Self {
         let server_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let server = PgConnectOptions::from_str(&server_url).expect("invalid DATABASE_URL");
-        let name = format!("ledger_test_{}", Uuid::new_v4().simple());
+        let name = database_name(std::env::var(TAG_VAR).ok().as_deref());
 
         let mut admin = PgConnection::connect_with(&server)
             .await
@@ -159,6 +178,25 @@ mod tests {
         let name = name.downcast_ref::<String>().unwrap();
 
         assert!(!exists(&observer.pool(), name).await);
+    }
+
+    #[test]
+    fn a_tag_goes_into_the_name_so_its_databases_can_be_found() {
+        let tagged = database_name(Some("breakage"));
+        assert!(tagged.starts_with("ledger_test_breakage_"), "{tagged}");
+        // PostgreSQL cuts names at 63 bytes, which could make two the same.
+        assert!(tagged.len() <= 63, "{tagged}");
+        assert!(database_name(Some("a_16_char_tag_xx")).len() <= 63);
+
+        let plain = database_name(None);
+        assert!(plain.starts_with("ledger_test_"), "{plain}");
+        assert_ne!(database_name(None), database_name(None));
+    }
+
+    #[test]
+    #[should_panic(expected = "LEDGER_TEST_DB_TAG must be")]
+    fn a_tag_that_could_break_out_of_the_name_is_refused() {
+        database_name(Some("x\"; DROP DATABASE ledger; --"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
